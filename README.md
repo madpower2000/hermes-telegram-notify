@@ -8,14 +8,15 @@ but uses Hermes' public Python plugin API rather than Codex hook scripts.
 
 ## What it does
 
-The plugin registers four observer hooks:
+The plugin registers five observer hooks:
 
 | Hermes hook | Notification |
 |---|---|
-| `pre_llm_call` | One **Hermes · Started** message per turn |
-| `on_session_end` | One completion message classified as `completed`, `interrupted`, or `failed` |
-| `pre_approval_request` | Immediate **Hermes · Approval required** message |
-| `post_approval_response` | Optional decision/timeout message |
+| `pre_llm_call` | One **🚀 Hermes · Started** message per turn |
+| `post_llm_call` | **✅ Hermes · Completed** plus the final assistant response |
+| `on_session_end` | **⏸️ Interrupted** or **❌ Failed** fallback notification |
+| `pre_approval_request` | Immediate **⚠️ Hermes · Approval required** message |
+| `post_approval_response` | Optional decision/timeout message with emoji |
 
 Telegram failures, malformed payloads, missing credentials, and file-state
 problems are fail-open: they are logged or ignored and never abort the Hermes
@@ -39,16 +40,21 @@ Codex plugin and has no runtime dependency on it.
 - Hermes fires `pre_llm_call` once in the per-turn prologue, before the
   tool-calling loop; it is not a per-HTTP-request hook. The state store still
   deduplicates by `(session_id, turn_id)` as a defensive guarantee.
+- `post_llm_call` fires once after a successful, non-interrupted turn and
+  carries `assistant_response`; this is the source of the Telegram final answer.
 - `on_session_end` fires at the end of every `run_conversation()` turn and on
   relevant CLI/TUI interruption paths. It is not a final persistent-session
   teardown event. A long-lived Gateway conversation can consequently produce
-  one completion notification per user turn.
+  one completion notification per user turn. Shared state claims prevent it
+  from duplicating the successful `post_llm_call` notification.
 - Hermes approval hooks are observers. `pre_approval_request` can notify but
   cannot approve, deny, or block the request; this is the closest safe native
   equivalent to Codex `PermissionRequest`.
 - Hermes' canonical `on_session_end` payload contains status flags and an exit
-  reason, not unrestricted final model text. This plugin sends status metadata,
-  never chain-of-thought, hidden reasoning, full prompts, or full context.
+  reason, not final model text. Successful text comes only from the documented
+  `post_llm_call.assistant_response` field. It is bounded and token-redacted;
+  chain-of-thought, hidden reasoning, full prompts, and full context are never
+  sent.
 
 ## Installation
 
@@ -155,6 +161,7 @@ The supported keys are:
   "notify_on_approval_response": false,
   "approval_debounce_seconds": 60,
   "max_message_chars": 3900,
+  "final_response_max_chars": 3200,
   "telegram_timeout_seconds": 4,
   "state_retention_days": 7,
   "include_model": true,
@@ -215,13 +222,16 @@ hermes logs --level INFO
 
 ## Message safety and formatting
 
-Messages identify Hermes explicitly and include only bounded operational data:
-project basename, status, sanitized action/command, model, surface, session or
-turn identifiers, exit reason, and elapsed time where available. The plugin
-never sends full prompts, conversation history, environment dumps, model
-reasoning, or unrestricted command output. Common secret-bearing command
-arguments (`token`, `password`, `secret`, `api-key`, authorization) are
-redacted before formatting.
+Messages identify Hermes explicitly and stay compact. Start messages contain
+only the project name. Successful completion messages contain the project name
+and the bounded final assistant response. Approval messages contain a sanitized
+command and optional reason. Interrupted/failed messages contain the project
+and a short reason. Session IDs, turn IDs, model names, and elapsed timing are
+intentionally omitted from Telegram messages. The plugin never sends full
+prompts, conversation history, environment dumps, model reasoning, or
+unrestricted command output. Common secret-bearing command arguments (`token`,
+`password`, `secret`, `api-key`, authorization) and token-shaped values in the
+final response are redacted.
 
 ## State, locking, and duplicate suppression
 
@@ -246,8 +256,9 @@ fingerprinted and debounced (60 seconds by default).
 - Approval hooks cannot change Hermes' decision. `post_approval_response` is
   disabled by default because approval responses can be noisy; enable it with
   `notify_on_approval_response: true`.
-- Hermes does not expose a canonical final response body in `on_session_end`;
-  completion messages therefore report status, not a model-result preview.
+- Interrupted and failed `on_session_end` notifications have no final response
+  body because Hermes does not expose one on that lifecycle contract. Successful
+  responses use `post_llm_call` instead.
 - Chat discovery requires a recent update and may not work until the bot has
   received a message in the target chat.
 - This plugin is outbound-only; it does not turn Telegram into a Hermes input

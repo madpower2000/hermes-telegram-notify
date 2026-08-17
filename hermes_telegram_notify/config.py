@@ -31,6 +31,7 @@ DEFAULTS: dict[str, Any] = {
     "notify_on_approval_response": False,
     "approval_debounce_seconds": 60,
     "max_message_chars": 3900,
+    "final_response_max_chars": 3200,
     "telegram_timeout_seconds": 4,
     "state_retention_days": 7,
     "log_max_bytes": 524_288,

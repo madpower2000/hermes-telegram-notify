@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
+from .logging_utils import redact
+
 _SECRET_ARG_RE = re.compile(r"(?i)(--?(?:token|password|passwd|secret|api[-_]?key|authorization)|(?:token|password|secret|api[-_]?key)\s*[=:])(?:\s+|\s*=\s*)[^\s]+")
 
 
@@ -41,12 +43,14 @@ def project_name(cwd: Any = None) -> str:
     return truncate(name or "unknown", 80)
 
 
-def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int) -> str:
-    output = [f"Hermes · {title}"]
+def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int, body: str = "") -> str:
+    output = [title]
     for label, value in fields:
         if value is None or value == "":
             continue
         output.append(f"{label}: {truncate(value, 700)}")
+    if body:
+        output.extend(("", body))
     message = "\n".join(output)
     if len(message) <= max_chars:
         return message
@@ -54,58 +58,57 @@ def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int) -> str:
 
 
 def started(*, session_id: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, max_chars: int = 3900) -> str:
-    fields = [("Project", project_name(cwd)), ("Status", "started")]
-    if model:
-        fields.append(("Model", model))
-    if session_id:
-        fields.append(("Session", session_id))
-    if turn_id:
-        fields.append(("Turn", turn_id))
-    elif task_id:
-        fields.append(("Task", task_id))
-    return _lines("Started", fields, max_chars)
+    del session_id, task_id, turn_id, model
+    return _lines("🚀 Hermes · Started", [("Project", project_name(cwd))], max_chars)
 
 
-def completion(*, status: str, session_id: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, reason: Any = None, elapsed_seconds: Any = None, max_chars: int = 3900) -> str:
-    fields: list[tuple[str, Any]] = [("Project", project_name(cwd)), ("Status", status)]
-    if reason:
+def safe_response(value: Any, limit: int = 3200) -> str:
+    """Bound and redact final assistant text before sending it to Telegram."""
+    text = "" if value is None else str(value)
+    text = text.replace("\x00", "").strip()
+    text = redact(text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def completion(*, status: str, session_id: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, reason: Any = None, elapsed_seconds: Any = None, response: Any = None, response_max_chars: int = 3200, max_chars: int = 3900) -> str:
+    del session_id, task_id, turn_id, model, elapsed_seconds
+    status = str(status or "failed").lower()
+    title = {
+        "completed": "✅ Hermes · Completed",
+        "interrupted": "⏸️ Hermes · Interrupted",
+        "failed": "❌ Hermes · Failed",
+    }.get(status, "ℹ️ Hermes · Finished")
+    body = safe_response(response, response_max_chars) if status == "completed" else ""
+    fields: list[tuple[str, Any]] = [("Project", project_name(cwd))]
+    if reason and not body:
         fields.append(("Reason", reason))
-    if elapsed_seconds is not None:
-        try:
-            fields.append(("Elapsed", f"{float(elapsed_seconds):.1f}s"))
-        except (TypeError, ValueError):
-            pass
-    if model:
-        fields.append(("Model", model))
-    if session_id:
-        fields.append(("Session", session_id))
-    if turn_id:
-        fields.append(("Turn", turn_id))
-    elif task_id:
-        fields.append(("Task", task_id))
-    return _lines(status.title(), fields, max_chars)
+    return _lines(title, fields, max_chars, body)
 
 
 def approval(*, command: Any = None, description: Any = None, session_key: Any = None, turn_id: Any = None, cwd: Any = None, surface: Any = None, max_chars: int = 3900) -> str:
-    fields = [("Project", project_name(cwd)), ("Action", safe_command(command))]
+    del session_key, turn_id, surface
+    fields = [("Project", project_name(cwd)), ("Command", safe_command(command))]
     if description:
         fields.append(("Reason", truncate(description, 500)))
-    if surface:
-        fields.append(("Surface", surface))
-    if session_key:
-        fields.append(("Session", session_key))
-    if turn_id:
-        fields.append(("Turn", turn_id))
-    return _lines("Approval required", fields, max_chars)
+    return _lines("⚠️ Hermes · Approval required", fields, max_chars)
 
 
 def approval_response(*, choice: Any = None, command: Any = None, session_key: Any = None, turn_id: Any = None, decided_by: Any = None, max_chars: int = 3900) -> str:
+    del session_key, turn_id
     value = str(choice or "unknown").replace("_", "-")
-    fields = [("Status", value), ("Action", safe_command(command))]
+    emoji = {
+        "once": "✅",
+        "session": "✅",
+        "always": "✅",
+        "deny": "❌",
+        "timeout": "⏱️",
+        "notify-failed": "⚠️",
+        "smart-approve": "🤖✅",
+        "smart-deny": "🤖❌",
+    }.get(value, "ℹ️")
+    fields = [("Command", safe_command(command))]
     if decided_by:
         fields.append(("Decided by", decided_by))
-    if session_key:
-        fields.append(("Session", session_key))
-    if turn_id:
-        fields.append(("Turn", turn_id))
-    return _lines("Approval response", fields, max_chars)
+    return _lines(f"{emoji} Hermes · Approval {value}", fields, max_chars)

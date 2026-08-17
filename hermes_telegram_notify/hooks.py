@@ -79,6 +79,80 @@ def _status(kwargs: dict[str, Any]) -> str:
     return "completed"
 
 
+def _send_completion(
+    cfg: config_mod.ResolvedConfig,
+    kwargs: dict[str, Any],
+    *,
+    status: str,
+    response: Any = None,
+) -> None:
+    """Claim and send one completion/result notification.
+
+    Successful turns reach this helper from ``post_llm_call`` with the final
+    assistant response. Interrupted/failed turns reach it from
+    ``on_session_end``. The shared claim prevents the latter from sending a
+    second success message after ``post_llm_call`` has already sent the result.
+    """
+    if not cfg.event_enabled("completion"):
+        return None
+    if not cfg.configured:
+        _record(cfg, "completion_skipped", reason="missing_configuration")
+        return None
+    key = _completion_key(kwargs)
+    claimed, previous = _state(cfg).claim_completion(
+        key,
+        {
+            "session_id": str(kwargs.get("session_id") or ""),
+            "task_id": str(kwargs.get("task_id") or ""),
+            "turn_id": str(kwargs.get("turn_id") or ""),
+            "status": status,
+        },
+    )
+    if not claimed:
+        _record(cfg, "completion_suppressed", reason="duplicate_turn")
+        return None
+    try:
+        started_at = float((previous or {}).get("started_at") or 0)
+    except (TypeError, ValueError):
+        started_at = 0.0
+    elapsed = time.time() - started_at if started_at else None
+    # The successful path has the final response; failure/interruption paths
+    # deliberately expose only a short reason and no internal transcript.
+    reason = None if status == "completed" else kwargs.get("turn_exit_reason") or kwargs.get("reason")
+    text = formatting.completion(
+        status=status,
+        session_id=kwargs.get("session_id"),
+        task_id=kwargs.get("task_id"),
+        turn_id=kwargs.get("turn_id"),
+        model=kwargs.get("model") if cfg.values.get("include_model", True) else None,
+        cwd=kwargs.get("cwd") or kwargs.get("working_directory") if cfg.values.get("include_cwd", True) else None,
+        reason=reason,
+        elapsed_seconds=elapsed,
+        response=response,
+        response_max_chars=int(cfg.values.get("final_response_max_chars", 3200)),
+        max_chars=int(cfg.values.get("max_message_chars", 3900)),
+    )
+    _notify(cfg, text, "completion")
+
+
+def on_post_llm_call(**kwargs: Any) -> None:
+    """Send the final assistant response after a successful Hermes turn."""
+    try:
+        cfg = config_mod.load_config()
+        _send_completion(
+            cfg,
+            kwargs,
+            status="completed",
+            response=kwargs.get("assistant_response"),
+        )
+    except Exception as exc:
+        try:
+            _record(config_mod.load_config(), "hook_failed", hook="post_llm_call", error=type(exc).__name__)
+        except Exception:
+            pass
+    return None
+
+
 def on_pre_llm_call(**kwargs: Any) -> None:
     try:
         cfg = config_mod.load_config()
@@ -120,43 +194,8 @@ def on_pre_llm_call(**kwargs: Any) -> None:
 def on_session_end(**kwargs: Any) -> None:
     try:
         cfg = config_mod.load_config()
-        if not cfg.event_enabled("completion") or not cfg.configured:
-            if cfg.event_enabled("completion"):
-                _record(cfg, "completion_skipped", reason="missing_configuration")
-            return None
-        key = _completion_key(kwargs)
-        store = _state(cfg)
         status = _status(kwargs)
-        claimed, previous = store.claim_completion(
-            key,
-            {
-                "session_id": str(kwargs.get("session_id") or ""),
-                "task_id": str(kwargs.get("task_id") or ""),
-                "turn_id": str(kwargs.get("turn_id") or ""),
-                "status": status,
-            },
-        )
-        if not claimed:
-            _record(cfg, "completion_suppressed", reason="duplicate_turn")
-            return None
-        try:
-            started_at = float((previous or {}).get("started_at") or 0)
-        except (TypeError, ValueError):
-            started_at = 0.0
-        elapsed = time.time() - started_at if started_at else None
-        reason = kwargs.get("turn_exit_reason") or kwargs.get("reason")
-        text = formatting.completion(
-            status=status,
-            session_id=kwargs.get("session_id"),
-            task_id=kwargs.get("task_id"),
-            turn_id=kwargs.get("turn_id"),
-            model=kwargs.get("model") if cfg.values.get("include_model", True) else None,
-            cwd=kwargs.get("cwd") or kwargs.get("working_directory") if cfg.values.get("include_cwd", True) else None,
-            reason=reason,
-            elapsed_seconds=elapsed,
-            max_chars=int(cfg.values.get("max_message_chars", 3900)),
-        )
-        _notify(cfg, text, "completion")
+        _send_completion(cfg, kwargs, status=status)
     except Exception as exc:
         try:
             _record(config_mod.load_config(), "hook_failed", hook="on_session_end", error=type(exc).__name__)

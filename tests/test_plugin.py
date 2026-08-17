@@ -125,7 +125,7 @@ def test_formatting_truncates_and_redacts():
         cwd="/home/max/project",
         max_chars=300,
     )
-    assert text.startswith("Hermes · Approval required")
+    assert text.startswith("⚠️ Hermes · Approval required")
     assert len(text) <= 300
     assert "supersecret-value" not in text
     assert "project" in text
@@ -155,8 +155,52 @@ def test_completion_statuses(hermes_home, monkeypatch, flags, expected):
     monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
     hooks.on_session_end(session_id="s", turn_id=expected, model="m", cwd="/tmp/zorro", **flags)
     text = sender.send_message.call_args.args[1]
-    assert f"Status: {expected}" in text
-    assert expected != "completed" or "Status: completed" in text
+    assert text.startswith({
+        "completed": "✅ Hermes · Completed",
+        "interrupted": "⏸️ Hermes · Interrupted",
+        "failed": "❌ Hermes · Failed",
+    }[expected])
+    assert "Session:" not in text
+    assert "Turn:" not in text
+    assert "Model:" not in text
+
+
+def test_post_llm_sends_final_response_and_session_end_does_not_duplicate(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_id": "s",
+        "task_id": "task",
+        "turn_id": "t",
+        "model": "m",
+        "platform": "cli",
+    }
+    hooks.on_post_llm_call(**payload, assistant_response="Final answer from Hermes.")
+    hooks.on_session_end(**payload, completed=True, failed=False, interrupted=False)
+    assert sender.send_message.call_count == 1
+    text = sender.send_message.call_args.args[1]
+    assert text.startswith("✅ Hermes · Completed")
+    assert "Project:" in text
+    assert "Final answer from Hermes." in text
+    assert "Session:" not in text
+    assert "Turn:" not in text
+
+
+def test_final_response_is_redacted_and_bounded(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch, final_response_max_chars=80)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_post_llm_call(
+        session_id="s",
+        turn_id="t",
+        assistant_response="safe 123456:abcdefghijklmnopqrstuv " + "x" * 1000,
+        cwd="/tmp/zorro",
+    )
+    text = sender.send_message.call_args.args[1]
+    assert "123456:abcdefghijklmnopqrstuv" not in text
+    assert len(text) <= 3900
+    assert text.endswith("…")
 
 
 def test_completion_is_deduplicated(hermes_home, monkeypatch):
