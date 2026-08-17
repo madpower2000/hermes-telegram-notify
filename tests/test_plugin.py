@@ -139,6 +139,24 @@ def test_start_event_is_deduplicated(hermes_home, monkeypatch):
     hooks.on_pre_llm_call(session_id="s", task_id="task", turn_id="turn", user_message="hello", cwd="/tmp/zorro")
     assert sender.send_message.call_count == 1
     assert "Hermes · Started" in sender.send_message.call_args.args[1]
+    assert "Session: New session" in sender.send_message.call_args.args[1]
+
+
+def test_named_profile_is_used_as_project_when_cwd_is_absent(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes" / "profiles" / "zorro"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert formatting.project_name() == "zorro"
+
+
+def test_session_title_is_loaded_from_hermes_database(monkeypatch):
+    session_db = Mock()
+    session_db.get_session_title.return_value = "ZAP M6"
+    session_db.__enter__ = Mock(return_value=session_db)
+    session_db.__exit__ = Mock(return_value=False)
+    fake_module = type("FakeHermesState", (), {"SessionDB": Mock(return_value=session_db)})
+    with patch.dict(sys.modules, {"hermes_state": fake_module}):
+        assert formatting.session_name(session_id="s") == "ZAP M6"
 
 
 @pytest.mark.parametrize(
@@ -160,7 +178,7 @@ def test_completion_statuses(hermes_home, monkeypatch, flags, expected):
         "interrupted": "⏸️ Hermes · Interrupted",
         "failed": "❌ Hermes · Failed",
     }[expected])
-    assert "Session:" not in text
+    assert "Session: New session" in text
     assert "Turn:" not in text
     assert "Model:" not in text
 
@@ -183,7 +201,7 @@ def test_post_llm_sends_final_response_and_session_end_does_not_duplicate(hermes
     assert text.startswith("✅ Hermes · Completed")
     assert "Project:" in text
     assert "Final answer from Hermes." in text
-    assert "Session:" not in text
+    assert "Session: New session" in text
     assert "Turn:" not in text
 
 

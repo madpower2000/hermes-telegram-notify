@@ -122,6 +122,7 @@ def _send_completion(
     text = formatting.completion(
         status=status,
         session_id=kwargs.get("session_id"),
+        session_name_value=kwargs.get("session_name") or kwargs.get("session_title") or kwargs.get("title"),
         task_id=kwargs.get("task_id"),
         turn_id=kwargs.get("turn_id"),
         model=kwargs.get("model") if cfg.values.get("include_model", True) else None,
@@ -175,6 +176,7 @@ def on_pre_llm_call(**kwargs: Any) -> None:
             return None
         text = formatting.started(
             session_id=kwargs.get("session_id"),
+            session_name_value=kwargs.get("session_name") or kwargs.get("session_title") or kwargs.get("title"),
             task_id=kwargs.get("task_id"),
             turn_id=kwargs.get("turn_id"),
             model=kwargs.get("model") if cfg.values.get("include_model", True) else None,
@@ -228,6 +230,8 @@ def on_pre_approval_request(**kwargs: Any) -> None:
         text = formatting.approval(
             command=kwargs.get("command"),
             description=kwargs.get("description"),
+            session_id=kwargs.get("session_id"),
+            session_name_value=kwargs.get("session_name") or kwargs.get("session_title") or kwargs.get("title"),
             session_key=kwargs.get("session_key"),
             turn_id=kwargs.get("turn_id"),
             cwd=kwargs.get("cwd") or kwargs.get("working_directory"),
@@ -255,6 +259,8 @@ def on_post_approval_response(**kwargs: Any) -> None:
         text = formatting.approval_response(
             choice=choice,
             command=kwargs.get("command"),
+            session_id=kwargs.get("session_id"),
+            session_name_value=kwargs.get("session_name") or kwargs.get("session_title") or kwargs.get("title"),
             session_key=kwargs.get("session_key"),
             turn_id=kwargs.get("turn_id"),
             decided_by=kwargs.get("decided_by"),

@@ -223,13 +223,19 @@ hermes logs --level INFO
 ## Message safety and formatting
 
 Messages identify Hermes explicitly and stay compact. Start messages contain
-only the project name. Successful completion messages contain the project name
-and the bounded final assistant response. Approval messages contain a sanitized
-command and optional reason. Interrupted/failed messages contain the project
-and a short reason. Session IDs, turn IDs, model names, and elapsed timing are
-intentionally omitted from Telegram messages. The plugin never sends full
-prompts, conversation history, environment dumps, model reasoning, or
-unrestricted command output. Common secret-bearing command arguments (`token`,
+the project identity and the human-readable Hermes session title. When the
+hook does not carry a title, the plugin reads it best-effort from the active
+profile's `state.db`; a genuinely untitled session is shown as `New session`
+rather than exposing a raw technical ID. Successful completion messages contain
+the project identity, session title, and the bounded final assistant response.
+Approval messages contain a sanitized command and optional reason.
+Interrupted/failed messages contain the project, session title, and a short
+reason. Turn IDs, model names, and elapsed timing are intentionally omitted
+from Telegram messages. In a named profile, the profile name (for example,
+`zorro`) is used as the project identity when Hermes does not provide an
+explicit working directory. The plugin never sends full prompts,
+conversation history, environment dumps, model reasoning, or unrestricted
+command output. Common secret-bearing command arguments (`token`,
 `password`, `secret`, `api-key`, authorization) and token-shaped values in the
 final response are redacted.
 
