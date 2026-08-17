@@ -82,6 +82,12 @@ def test_token_is_not_in_status_or_log(hermes_home, monkeypatch, capsys):
     assert token not in log_text
 
 
+def test_redaction_covers_numeric_bot_tokens():
+    from hermes_telegram_notify.logging_utils import redact
+    assert "123456:abcdefghijklmnopqrstuv" not in redact("error 123456:abcdefghijklmnopqrstuv")
+    assert "[REDACTED]" in redact("error 123456:abcdefghijklmnopqrstuv")
+
+
 def test_telegram_request_generation_and_success():
     response = Mock()
     response.read.return_value = b'{"ok":true,"result":{"message_id":1}}'

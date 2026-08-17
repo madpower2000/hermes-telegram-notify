@@ -9,7 +9,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any
 
 _LOGGER_NAME = "hermes.telegram_notify"
-_TOKEN_RE = re.compile(r"(bot)\d{6,}:[A-Za-z0-9_-]{20,}", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"(?:bot)?\d{6,}:[A-Za-z0-9_-]{20,}", re.IGNORECASE)
 _BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~-]+")
 
 
@@ -19,7 +19,7 @@ def redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact(v) for v in value]
     if isinstance(value, str):
-        value = _TOKEN_RE.sub(r"\1[REDACTED]", value)
+        value = _TOKEN_RE.sub("[REDACTED]", value)
         return _BEARER_RE.sub(r"\1[REDACTED]", value)
     return value
 
@@ -32,6 +32,13 @@ def configure_logging(path, max_bytes: int = 524_288, backup_bytes: int = 262_14
     log = logger()
     log.setLevel(logging.INFO)
     log.propagate = False
+    path = path.resolve()
+    for existing in list(log.handlers):
+        if not getattr(existing, "_hermes_telegram_notify", False):
+            continue
+        if getattr(existing, "baseFilename", None) != str(path):
+            log.removeHandler(existing)
+            existing.close()
     if not any(getattr(h, "_hermes_telegram_notify", False) for h in log.handlers):
         path.parent.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(

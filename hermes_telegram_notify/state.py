@@ -25,6 +25,13 @@ except ImportError:  # pragma: no cover
 _EMPTY = {"version": 1, "runs": {}, "approvals": {}, "updated_at": 0.0}
 
 
+def _timestamp(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def fingerprint(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
@@ -67,17 +74,17 @@ class StateStore:
             return dict(_EMPTY)
         runs = value.get("runs") if isinstance(value.get("runs"), dict) else {}
         approvals = value.get("approvals") if isinstance(value.get("approvals"), dict) else {}
-        return {"version": 1, "runs": runs, "approvals": approvals, "updated_at": float(value.get("updated_at") or 0)}
+        return {"version": 1, "runs": runs, "approvals": approvals, "updated_at": _timestamp(value.get("updated_at"))}
 
     def _purge(self, data: dict[str, Any]) -> None:
         cutoff = time.time() - self.retention_seconds
         data["runs"] = {
             key: value for key, value in data["runs"].items()
-            if isinstance(value, dict) and float(value.get("updated_at") or value.get("started_at") or 0) >= cutoff
+            if isinstance(value, dict) and _timestamp(value.get("updated_at") or value.get("started_at")) >= cutoff
         }
         data["approvals"] = {
             key: value for key, value in data["approvals"].items()
-            if isinstance(value, dict) and float(value.get("updated_at") or 0) >= cutoff
+            if isinstance(value, dict) and _timestamp(value.get("updated_at")) >= cutoff
         }
 
     def _write(self, data: Mapping[str, Any]) -> None:
@@ -126,7 +133,7 @@ class StateStore:
         now = time.time()
         with self._locked() as data:
             previous = data["approvals"].get(key)
-            if isinstance(previous, dict) and now - float(previous.get("updated_at") or 0) < max(0, debounce_seconds):
+            if isinstance(previous, dict) and now - _timestamp(previous.get("updated_at")) < max(0, debounce_seconds):
                 return False
             data["approvals"][key] = {**metadata, "updated_at": now}
             return True

@@ -139,7 +139,10 @@ def on_session_end(**kwargs: Any) -> None:
         if not claimed:
             _record(cfg, "completion_suppressed", reason="duplicate_turn")
             return None
-        started_at = float((previous or {}).get("started_at") or 0)
+        try:
+            started_at = float((previous or {}).get("started_at") or 0)
+        except (TypeError, ValueError):
+            started_at = 0.0
         elapsed = time.time() - started_at if started_at else None
         reason = kwargs.get("turn_exit_reason") or kwargs.get("reason")
         text = formatting.completion(

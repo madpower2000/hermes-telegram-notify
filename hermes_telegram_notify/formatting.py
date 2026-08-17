@@ -47,7 +47,10 @@ def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int) -> str:
         if value is None or value == "":
             continue
         output.append(f"{label}: {truncate(value, 700)}")
-    return truncate("\n".join(output), max_chars)
+    message = "\n".join(output)
+    if len(message) <= max_chars:
+        return message
+    return message[: max(0, max_chars - 1)].rstrip() + "…"
 
 
 def started(*, session_id: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, max_chars: int = 3900) -> str:
