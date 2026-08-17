@@ -5,7 +5,7 @@ author: "Hermes Agent community"
 license: MIT
 api_version: 1
 kind: standalone
-hooks:
+provides_hooks:
   - pre_llm_call
   - on_session_end
   - pre_approval_request
