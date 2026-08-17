@@ -1,0 +1,21 @@
+name: telegram-notify
+version: "1.0.0"
+description: "Sends compact Hermes lifecycle notifications to Telegram."
+author: "Hermes Agent community"
+license: MIT
+api_version: 1
+kind: standalone
+hooks:
+  - pre_llm_call
+  - on_session_end
+  - pre_approval_request
+  - post_approval_response
+optional_env:
+  - TELEGRAM_BOT_TOKEN
+  - TELEGRAM_CHAT_ID
+  - HERMES_TELEGRAM_CHAT_ID
+  - TELEGRAM_HOME_CHANNEL
+tags:
+  - notifications
+  - telegram
+  - lifecycle
