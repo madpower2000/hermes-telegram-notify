@@ -32,13 +32,15 @@ def safe_command(value: Any, limit: int = 700) -> str:
     return truncate(text, limit)
 
 
-def project_name(cwd: Any = None) -> str:
+def project_name(cwd: Any = None, session_id: Any = None) -> str:
+    if not cwd and session_id:
+        cwd = _stored_session_cwd(session_id)
     if not cwd:
         # Gateway services commonly run from the user's home directory rather
         # than the project that owns the conversation. A named Hermes profile
-        # is the stable project-like identity in that case (for example,
-        # ``~/.hermes/profiles/zorro`` -> ``zorro``). An explicit cwd still
-        # wins for callers that genuinely provide one.
+        # is the fallback when neither the event nor the session record has a
+        # working directory (for example, ``~/.hermes/profiles/zorro`` ->
+        # ``zorro``). An explicit cwd always wins.
         try:
             from hermes_constants import get_hermes_home
 
@@ -78,6 +80,23 @@ def _stored_session_title(session_id: Any) -> str:
         return ""
 
 
+def _stored_session_cwd(session_id: Any) -> str:
+    """Resolve a session's recorded workspace when a hook omits its cwd."""
+    value = str(session_id or "").strip()
+    if not value:
+        return ""
+    session: Any = None
+    try:
+        from hermes_state import SessionDB
+
+        with SessionDB(read_only=True) as session_db:
+            session = session_db.get_session(value)
+        cwd = session.get("cwd") if isinstance(session, Mapping) else None
+        return cwd.strip() if isinstance(cwd, str) else ""
+    except Exception:
+        return ""
+
+
 def session_name(*, session_id: Any = None, explicit: Any = None) -> str:
     """Return a safe human-readable session name without exposing raw IDs."""
     for candidate in (explicit, _stored_session_title(session_id)):
@@ -109,7 +128,7 @@ def started(*, session_id: Any = None, session_name_value: Any = None, task_id: 
     del task_id, turn_id, model
     return _lines(
         "🚀 Hermes · Started",
-        [("Project", project_name(cwd)), _session_field(session_id, session_name_value)],
+        [("Project", project_name(cwd, session_id)), _session_field(session_id, session_name_value)],
         max_chars,
     )
 
@@ -134,7 +153,7 @@ def completion(*, status: str, session_id: Any = None, session_name_value: Any =
     }.get(status, "ℹ️ Hermes · Finished")
     body = safe_response(response, response_max_chars) if status == "completed" else ""
     fields: list[tuple[str, Any]] = [
-        ("Project", project_name(cwd)),
+        ("Project", project_name(cwd, session_id)),
         _session_field(session_id, session_name_value),
     ]
     if reason and not body:
@@ -145,7 +164,7 @@ def completion(*, status: str, session_id: Any = None, session_name_value: Any =
 def approval(*, command: Any = None, description: Any = None, session_id: Any = None, session_name_value: Any = None, session_key: Any = None, turn_id: Any = None, cwd: Any = None, surface: Any = None, max_chars: int = 3900) -> str:
     del session_key, turn_id, surface
     fields = [
-        ("Project", project_name(cwd)),
+        ("Project", project_name(cwd, session_id)),
         _session_field(session_id, session_name_value),
         ("Command", safe_command(command)),
     ]

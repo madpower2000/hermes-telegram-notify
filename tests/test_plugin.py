@@ -171,6 +171,33 @@ def test_named_profile_is_used_as_project_when_cwd_is_absent(tmp_path, monkeypat
     assert formatting.project_name() == "zorro"
 
 
+def test_approval_notification_uses_session_workspace_when_cwd_is_missing(hermes_home, monkeypatch):
+    home = hermes_home / "profiles" / "zorro"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    configure(home, monkeypatch)
+
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    session_db = Mock()
+    session_db.get_session.return_value = {"cwd": "/home/max/Projects/hermes-telegram-notify"}
+    session_db.get_session_title.return_value = "Reduce unnecessary Telegram approval notifications"
+    session_db.__enter__ = Mock(return_value=session_db)
+    session_db.__exit__ = Mock(return_value=False)
+    fake_module = type("FakeHermesState", (), {"SessionDB": Mock(return_value=session_db)})
+
+    with patch.dict(sys.modules, {"hermes_state": fake_module}):
+        hooks.on_pre_approval_request(
+            session_id="session-id", session_key="session-key", turn_id="turn",
+            tool_call_id="call", command="git branch -D example", surface="gateway",
+        )
+
+    text = sender.send_message.call_args.args[1]
+    assert "Project: hermes-telegram-notify" in text
+    assert "Project: zorro" not in text
+    assert "Session: Reduce unnecessary Telegram approval notifications" in text
+
+
 def test_session_title_is_loaded_from_hermes_database(monkeypatch):
     session_db = Mock()
     session_db.get_session_title.return_value = "ZAP M6"
