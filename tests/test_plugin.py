@@ -142,6 +142,28 @@ def test_start_event_is_deduplicated(hermes_home, monkeypatch):
     assert "Session: New session" in sender.send_message.call_args.args[1]
 
 
+def test_subagent_start_is_suppressed_before_root_start_claim(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_id": "s",
+        "task_id": "task",
+        "turn_id": "turn",
+        "user_message": "hello",
+        "cwd": "/tmp/zorro",
+    }
+
+    hooks.on_pre_llm_call(**payload, platform="subagent", parent_session_id="root")
+    assert sender.send_message.call_count == 0
+
+    # An ignored child event must not claim the key for a later root event.
+    # Parent lineage alone is deliberately not a suppression criterion.
+    hooks.on_pre_llm_call(**payload, platform="cli", parent_session_id="lineage-parent")
+    assert sender.send_message.call_count == 1
+    assert "Hermes · Started" in sender.send_message.call_args.args[1]
+
+
 def test_named_profile_is_used_as_project_when_cwd_is_absent(tmp_path, monkeypatch):
     home = tmp_path / ".hermes" / "profiles" / "zorro"
     home.mkdir(parents=True)
@@ -203,6 +225,40 @@ def test_post_llm_sends_final_response_and_session_end_does_not_duplicate(hermes
     assert "Final answer from Hermes." in text
     assert "Session: New session" in text
     assert "Turn:" not in text
+
+
+@pytest.mark.parametrize(
+    ("callback_name", "extra", "expected"),
+    [
+        ("on_post_llm_call", {"assistant_response": "Final answer."}, "Hermes · Completed"),
+        ("on_session_end", {"completed": True, "failed": False, "interrupted": False}, "Hermes · Completed"),
+        ("on_session_end", {"completed": False, "failed": True, "interrupted": False}, "Hermes · Failed"),
+        ("on_session_end", {"completed": False, "failed": False, "interrupted": True}, "Hermes · Interrupted"),
+    ],
+)
+def test_subagent_completion_is_suppressed_before_root_completion_claim(
+    hermes_home, monkeypatch, callback_name, extra, expected,
+):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_id": "s",
+        "task_id": "task",
+        "turn_id": "turn",
+        "model": "m",
+        **extra,
+    }
+
+    callback = getattr(hooks, callback_name)
+    callback(**payload, platform="subagent", parent_session_id="root")
+    assert sender.send_message.call_count == 0
+
+    # The same identity can still produce the root's notification, even when
+    # parent lineage metadata is present.
+    callback(**payload, platform="cli", parent_session_id="lineage-parent")
+    assert sender.send_message.call_count == 1
+    assert expected in sender.send_message.call_args.args[1]
 
 
 def test_final_response_is_redacted_and_bounded(hermes_home, monkeypatch):

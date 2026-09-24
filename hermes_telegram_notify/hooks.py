@@ -93,6 +93,8 @@ def _send_completion(
     ``on_session_end``. The shared claim prevents the latter from sending a
     second success message after ``post_llm_call`` has already sent the result.
     """
+    if kwargs.get("platform") == "subagent":
+        return None
     if not cfg.event_enabled("completion"):
         return None
     if not cfg.configured:
@@ -156,6 +158,8 @@ def on_post_llm_call(**kwargs: Any) -> None:
 
 def on_pre_llm_call(**kwargs: Any) -> None:
     try:
+        if kwargs.get("platform") == "subagent":
+            return None
         cfg = config_mod.load_config()
         if not cfg.event_enabled("start"):
             return None

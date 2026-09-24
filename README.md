@@ -18,6 +18,10 @@ The plugin registers five observer hooks:
 | `pre_approval_request` | **⚠️ Hermes · Approval required** for user-facing prompts; smart assessments are suppressed |
 | `post_approval_response` | Optional decision/timeout message with emoji |
 
+Start and completion notifications are suppressed only when Hermes reports
+`platform="subagent"`. Parent-session metadata alone is not used to classify
+an agent, and missing or other platform values retain the existing behavior.
+
 Telegram failures, malformed payloads, missing credentials, and file-state
 problems are fail-open: they are logged or ignored and never abort the Hermes
 agent turn.
