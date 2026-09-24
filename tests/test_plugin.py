@@ -324,6 +324,61 @@ def test_smart_assessment_does_not_consume_real_prompt_debounce(hermes_home, mon
     assert "Approval required" in sender.send_message.call_args.args[1]
 
 
+def test_approval_diagnostics_log_surface_and_outcome_without_payload(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_key": "private-session-id",
+        "turn_id": "private-turn-id",
+        "tool_call_id": "private-tool-call-id",
+        "pattern_key": "dangerous-command",
+        "command": "rm -rf /private/path --token=must-not-be-logged",
+        "description": "recursive delete",
+        "surface": "smart",
+    }
+
+    hooks.on_pre_approval_request(**payload)
+    hooks.on_post_approval_response(**payload, choice="smart_approve", decided_by="aux_llm")
+
+    assert sender.send_message.call_count == 0
+    log_path = hermes_home / "telegram-notify" / "telegram-notify.log"
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    request = next(row for row in records if row["event"] == "approval_request_observed")
+    skipped = next(row for row in records if row["event"] == "approval_skipped")
+    response = next(row for row in records if row["event"] == "approval_response_observed")
+    assert request["surface"] == skipped["surface"] == response["surface"] == "smart"
+    assert request["approval_id"] == response["approval_id"]
+    assert response["choice"] == "smart_approve"
+    assert response["decided_by"] == "aux_llm"
+    assert isinstance(request["observed_at"], float)
+    for secret in (
+        payload["command"], payload["description"], payload["session_key"],
+        payload["turn_id"], payload["tool_call_id"],
+    ):
+        assert secret not in log_path.read_text()
+
+
+def test_approval_notification_log_identifies_its_surface(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_pre_approval_request(
+        session_key="s", turn_id="t", tool_call_id="c", pattern_key="dangerous-command",
+        command="git branch -D example", description="git branch force delete", surface="gateway",
+    )
+
+    assert sender.send_message.call_count == 1
+    log_path = hermes_home / "telegram-notify" / "telegram-notify.log"
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    request = next(row for row in records if row["event"] == "approval_request_observed")
+    sent = next(row for row in records if row.get("event") == "notification_sent")
+    assert request["surface"] == sent["surface"] == "gateway"
+    assert request["approval_id"] == sent["approval_id"]
+    assert sent["notification"] == "approval"
+    assert "git branch -D example" not in log_path.read_text()
+
+
 def test_malformed_payload_and_disabled_notifications_are_nonfatal(hermes_home, monkeypatch):
     configure(hermes_home, monkeypatch, enabled=False)
     sender = Mock()

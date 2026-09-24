@@ -39,16 +39,29 @@ def _record(cfg: config_mod.ResolvedConfig, event: str, **fields: Any) -> None:
         pass
 
 
-def _notify(cfg: config_mod.ResolvedConfig, text: str, event: str) -> bool:
+def _notify(
+    cfg: config_mod.ResolvedConfig,
+    text: str,
+    event: str,
+    *,
+    diagnostics: dict[str, Any] | None = None,
+) -> bool:
+    diagnostic_fields = diagnostics or {}
     if not cfg.configured:
-        _record(cfg, "notification_skipped", notification=event, reason="missing_configuration")
+        _record(
+            cfg, "notification_skipped", notification=event,
+            reason="missing_configuration", **diagnostic_fields,
+        )
         return False
     try:
         TelegramClient(cfg.token, int(cfg.values.get("telegram_timeout_seconds", 4))).send_message(cfg.chat_id, text)
     except (TelegramError, OSError, Exception) as exc:  # noqa: E722 - fail-open boundary
-        _record(cfg, "notification_failed", notification=event, error=type(exc).__name__)
+        _record(
+            cfg, "notification_failed", notification=event,
+            error=type(exc).__name__, **diagnostic_fields,
+        )
         return False
-    _record(cfg, "notification_sent", notification=event)
+    _record(cfg, "notification_sent", notification=event, **diagnostic_fields)
     return True
 
 
@@ -77,6 +90,53 @@ def _status(kwargs: dict[str, Any]) -> str:
     if bool(kwargs.get("failed")) or not bool(kwargs.get("completed")):
         return "failed"
     return "completed"
+
+
+def _approval_surface(value: Any) -> str:
+    """Return a bounded surface category, never an arbitrary payload value."""
+    if not isinstance(value, str):
+        return "unknown"
+    if value in {"smart", "cli", "gateway", "mcp-elicitation"}:
+        return value
+    if value.startswith("transport:"):
+        return "transport"
+    return "other"
+
+
+def _approval_diagnostic_id(kwargs: dict[str, Any]) -> str:
+    """Hash only bounded approval identifiers; never persist commands or descriptions."""
+    identity: dict[str, Any] = {}
+    for key in ("session_key", "turn_id", "tool_call_id", "pattern_key"):
+        value = kwargs.get(key)
+        if isinstance(value, str) and value:
+            identity[key] = value[:256]
+    pattern_keys = kwargs.get("pattern_keys")
+    if isinstance(pattern_keys, (list, tuple)):
+        safe_pattern_keys = [item[:128] for item in pattern_keys[:16] if isinstance(item, str)]
+        if safe_pattern_keys:
+            identity["pattern_keys"] = safe_pattern_keys
+    return fingerprint(identity) if identity else "unavailable"
+
+
+def _approval_choice(value: Any) -> str:
+    """Normalize known approval outcomes and collapse unexpected values."""
+    if not isinstance(value, str):
+        return "unknown"
+    choice = value.strip().lower()
+    if choice in {
+        "once", "session", "always", "deny", "timeout", "cancelled", "notify_failed",
+        "smart_approve", "smart_deny",
+    }:
+        return choice
+    if choice.startswith("transport_"):
+        return "transport_failure"
+    return "other"
+
+
+def _approval_decided_by(value: Any) -> str:
+    if value == "aux_llm":
+        return "aux_llm"
+    return "unknown" if value in (None, "") else "other"
 
 
 def _send_completion(
@@ -213,14 +273,21 @@ def on_session_end(**kwargs: Any) -> None:
 def on_pre_approval_request(**kwargs: Any) -> None:
     try:
         cfg = config_mod.load_config()
+        diagnostics = {
+            "approval_id": _approval_diagnostic_id(kwargs),
+            "surface": _approval_surface(kwargs.get("surface")),
+            "coalesced": kwargs.get("coalesced") is True,
+            "observed_at": time.time(),
+        }
+        _record(cfg, "approval_request_observed", **diagnostics)
         if not cfg.event_enabled("approval") or not cfg.configured:
             if cfg.event_enabled("approval"):
-                _record(cfg, "approval_skipped", reason="missing_configuration")
+                _record(cfg, "approval_skipped", reason="missing_configuration", **diagnostics)
             return None
-        if kwargs.get("surface") == "smart":
+        if diagnostics["surface"] == "smart":
             # Smart approval is still deciding whether to auto-approve or
             # escalate; a user-facing prompt emits its own hook if needed.
-            _record(cfg, "approval_skipped", reason="smart_assessment")
+            _record(cfg, "approval_skipped", reason="smart_assessment", **diagnostics)
             return None
         request_key = fingerprint({
             "session": kwargs.get("session_key"),
@@ -234,7 +301,7 @@ def on_pre_approval_request(**kwargs: Any) -> None:
             {"event": "pre_approval", "tool_call_id": str(kwargs.get("tool_call_id") or "")},
             int(cfg.values.get("approval_debounce_seconds", 60)),
         ):
-            _record(cfg, "approval_suppressed", reason="debounced")
+            _record(cfg, "approval_suppressed", reason="debounced", **diagnostics)
             return None
         text = formatting.approval(
             command=kwargs.get("command"),
@@ -247,7 +314,7 @@ def on_pre_approval_request(**kwargs: Any) -> None:
             surface=kwargs.get("surface"),
             max_chars=int(cfg.values.get("max_message_chars", 3900)),
         )
-        _notify(cfg, text, "approval")
+        _notify(cfg, text, "approval", diagnostics=diagnostics)
     except Exception as exc:
         try:
             _record(config_mod.load_config(), "hook_failed", hook="pre_approval_request", error=type(exc).__name__)
@@ -259,9 +326,18 @@ def on_pre_approval_request(**kwargs: Any) -> None:
 def on_post_approval_response(**kwargs: Any) -> None:
     try:
         cfg = config_mod.load_config()
+        choice = str(kwargs.get("choice") or "unknown")
+        diagnostics = {
+            "approval_id": _approval_diagnostic_id(kwargs),
+            "surface": _approval_surface(kwargs.get("surface")),
+            "choice": _approval_choice(choice),
+            "decided_by": _approval_decided_by(kwargs.get("decided_by")),
+            "coalesced": kwargs.get("coalesced") is True,
+            "observed_at": time.time(),
+        }
+        _record(cfg, "approval_response_observed", **diagnostics)
         if not cfg.event_enabled("approval_response") or not cfg.configured:
             return None
-        choice = str(kwargs.get("choice") or "unknown")
         key = f"post:{fingerprint({'session': kwargs.get('session_key'), 'turn': kwargs.get('turn_id'), 'tool_call': kwargs.get('tool_call_id'), 'choice': choice})}"
         if not _state(cfg).claim_approval(key, {"event": "post_approval", "choice": choice}, 86400):
             return None
@@ -275,7 +351,7 @@ def on_post_approval_response(**kwargs: Any) -> None:
             decided_by=kwargs.get("decided_by"),
             max_chars=int(cfg.values.get("max_message_chars", 3900)),
         )
-        _notify(cfg, text, "approval_response")
+        _notify(cfg, text, "approval_response", diagnostics=diagnostics)
     except Exception as exc:
         try:
             _record(config_mod.load_config(), "hook_failed", hook="post_approval_response", error=type(exc).__name__)

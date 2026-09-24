@@ -217,8 +217,10 @@ hermes telegram-notify logs --tail 50
 ```
 
 The log is stored at `$HERMES_HOME/telegram-notify/telegram-notify.log`,
-rotated at a bounded size, and written without token-bearing fields. Hermes'
-own logs can also be viewed with:
+rotated at a bounded size, and written without token-bearing fields. Approval
+diagnostics record a bounded surface category, outcome, timestamp, and opaque
+correlation ID; commands, descriptions, and raw session/tool-call IDs are never
+recorded. Hermes' own logs can also be viewed with:
 
 ```bash
 hermes logs --level INFO
