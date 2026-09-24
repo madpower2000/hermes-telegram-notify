@@ -15,7 +15,7 @@ The plugin registers five observer hooks:
 | `pre_llm_call` | One **🚀 Hermes · Started** message per turn |
 | `post_llm_call` | **✅ Hermes · Completed** plus the final assistant response |
 | `on_session_end` | **⏸️ Interrupted** or **❌ Failed** fallback notification |
-| `pre_approval_request` | Immediate **⚠️ Hermes · Approval required** message |
+| `pre_approval_request` | **⚠️ Hermes · Approval required** for user-facing prompts; smart assessments are suppressed |
 | `post_approval_response` | Optional decision/timeout message with emoji |
 
 Telegram failures, malformed payloads, missing credentials, and file-state
@@ -251,8 +251,9 @@ LLM HTTP request. The plugin claims a start record before sending and keys it by
 `session_id + turn_id`; repeated callbacks for the same turn are suppressed.
 If an exit-only payload lacks `turn_id`, it uses a stable task/message
 fingerprint. Completion is claimed independently, so duplicate finalization
-callbacks cannot send duplicate completion messages. Approval requests are
-fingerprinted and debounced (60 seconds by default).
+callbacks cannot send duplicate completion messages. User-facing approval
+requests are fingerprinted and debounced (60 seconds by default); smart-mode
+assessment hooks do not send or claim the debounce key.
 
 ## Failure behavior and limitations
 

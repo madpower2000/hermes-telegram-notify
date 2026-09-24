@@ -235,12 +235,37 @@ def test_approval_request_and_optional_response(hermes_home, monkeypatch):
     configure(hermes_home, monkeypatch, notify_on_approval_response=True)
     sender = Mock()
     monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
-    hooks.on_pre_approval_request(session_key="s", turn_id="t", tool_call_id="c", command="shell --password=bad", description="needs permission", cwd="/tmp/p")
+    hooks.on_pre_approval_request(
+        session_key="s", turn_id="t", tool_call_id="c", command="shell --password=bad",
+        description="needs permission", cwd="/tmp/p", surface="gateway",
+    )
     hooks.on_post_approval_response(session_key="s", turn_id="t", tool_call_id="c", choice="smart_deny", command="shell")
     assert sender.send_message.call_count == 2
     assert "Approval required" in sender.send_message.call_args_list[0].args[1]
     assert "smart-deny" in sender.send_message.call_args_list[1].args[1]
     assert "bad" not in sender.send_message.call_args_list[0].args[1]
+
+
+def test_smart_assessment_does_not_consume_real_prompt_debounce(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_key": "s",
+        "turn_id": "t",
+        "tool_call_id": "c",
+        "command": "rm -rf /tmp/example",
+        "description": "needs permission",
+        "cwd": "/tmp/p",
+    }
+
+    hooks.on_pre_approval_request(**payload, surface="smart")
+    assert sender.send_message.call_count == 0
+
+    # The real prompt has the same debounce identity, but a different surface.
+    hooks.on_pre_approval_request(**payload, surface="gateway")
+    assert sender.send_message.call_count == 1
+    assert "Approval required" in sender.send_message.call_args.args[1]
 
 
 def test_malformed_payload_and_disabled_notifications_are_nonfatal(hermes_home, monkeypatch):

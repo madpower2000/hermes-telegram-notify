@@ -213,6 +213,11 @@ def on_pre_approval_request(**kwargs: Any) -> None:
             if cfg.event_enabled("approval"):
                 _record(cfg, "approval_skipped", reason="missing_configuration")
             return None
+        if kwargs.get("surface") == "smart":
+            # Smart approval is still deciding whether to auto-approve or
+            # escalate; a user-facing prompt emits its own hook if needed.
+            _record(cfg, "approval_skipped", reason="smart_assessment")
+            return None
         request_key = fingerprint({
             "session": kwargs.get("session_key"),
             "turn": kwargs.get("turn_id"),
