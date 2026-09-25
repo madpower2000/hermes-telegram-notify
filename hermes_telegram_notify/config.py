@@ -1,9 +1,9 @@
-"""Configuration and secret resolution for telegram-notify.
+"""Configuration and profile-safe secret resolution for telegram-notify.
 
-The bot token is intentionally kept outside config.json. Resolution order is:
-explicit process environment, the profile .env (only for the token), then the
-plugin's mode-0600 credentials.json. Chat IDs are not secrets, but they still
-follow deterministic environment-over-config precedence.
+Hermes profile secrets are resolved with ``agent.secret_scope``. In a
+multiplexed runtime that scope is authoritative; this module never falls back
+to the launch profile's process environment. The token remains outside
+config.json, with the profile-local credentials file as a separate fallback.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ DEFAULTS: dict[str, Any] = {
     "telegram_timeout_seconds": 4,
     "state_retention_days": 7,
     "log_max_bytes": 524_288,
-    "log_backup_bytes": 262_144,
     "include_model": True,
     "include_cwd": True,
     "include_session": True,
@@ -55,6 +54,20 @@ _CHAT_ENV = (
     "TELEGRAM_HOME_CHANNEL",
 )
 _TOKEN_ENV = ("TELEGRAM_BOT_TOKEN",)
+
+# Hermes treats the exact HERMES_TELEGRAM_ prefix as process-global. The
+# notification switches and timeout/debounce knobs are global tuning; the
+# legacy CHAT_ID destination is single-profile-only and is ignored under
+# multiplexing to prevent cross-profile routing.
+_GLOBAL_TUNING_ENV = frozenset({
+    "HERMES_TELEGRAM_NOTIFY_ENABLED",
+    "HERMES_TELEGRAM_NOTIFY_START",
+    "HERMES_TELEGRAM_NOTIFY_COMPLETION",
+    "HERMES_TELEGRAM_NOTIFY_APPROVAL",
+    "HERMES_TELEGRAM_NOTIFY_APPROVAL_RESPONSE",
+    "HERMES_TELEGRAM_APPROVAL_DEBOUNCE",
+    "HERMES_TELEGRAM_TIMEOUT",
+})
 
 
 @dataclass(frozen=True)
@@ -141,13 +154,61 @@ def _read_dotenv_value(key: str) -> str:
     return ""
 
 
+def _secret_scope_api():
+    """Return Hermes' required profile secret-scope API; never silently downgrade."""
+    from agent.secret_scope import get_secret_str, is_multiplex_active
+    return get_secret_str, is_multiplex_active
+
+
+def _profile_env_value(key: str) -> str:
+    """Resolve profile credentials/config without borrowing ambient multiplex values."""
+    get_secret_str, is_multiplex_active = _secret_scope_api()
+    multiplexed = is_multiplex_active()
+    if key == "HERMES_TELEGRAM_CHAT_ID" and multiplexed:
+        # Hermes classifies the HERMES_TELEGRAM_ prefix as process-global, so
+        # this destination cannot safely be used for a routed profile. Ignore
+        # it under multiplexing rather than sending a secondary profile's text
+        # to the launch profile's chat; profile chat IDs use the other aliases.
+        value = ""
+    else:
+        value = get_secret_str(key, "")
+
+    # Outside multiplexing preserve the plugin's historical support for a
+    # profile .env even when Hermes' CLI did not load it into os.environ.
+    if not value and not multiplexed:
+        value = _read_dotenv_value(key)
+    return str(value or "").strip()
+
+
+def _global_tuning_value(key: str) -> str:
+    """Read only explicitly classified process-global Hermes tuning values."""
+    get_secret_str, _ = _secret_scope_api()
+    return str(get_secret_str(key, "") or "").strip()
+
+
+def resolve_profile_environment_value(key: str) -> str:
+    """Resolve a user-selected environment key in the active profile scope."""
+    _, is_multiplex_active = _secret_scope_api()
+    if is_multiplex_active():
+        # get_secret_str deliberately reads Hermes-global names from
+        # os.environ even with a profile scope bound. --token-env is different:
+        # it must never turn into an ambient credential escape hatch. Use
+        # Hermes' own classifier and refuse any global name while multiplexing.
+        from agent.secret_scope import _is_global_env
+        if _is_global_env(key):
+            return ""
+    return _profile_env_value(key)
+
+
+def _environment_value(key: str) -> str:
+    if key in _GLOBAL_TUNING_ENV:
+        return _global_tuning_value(key)
+    return _profile_env_value(key)
+
+
 def _first_env(keys: tuple[str, ...]) -> str:
     for key in keys:
-        value = os.environ.get(key, "").strip()
-        if value:
-            return value
-    for key in keys:
-        value = _read_dotenv_value(key).strip()
+        value = _environment_value(key)
         if value:
             return value
     return ""

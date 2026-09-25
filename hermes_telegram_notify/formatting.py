@@ -9,16 +9,30 @@ from typing import Any, Mapping
 
 from .logging_utils import redact
 
-_SECRET_ARG_RE = re.compile(r"(?i)(--?(?:token|password|passwd|secret|api[-_]?key|authorization)|(?:token|password|secret|api[-_]?key)\s*[=:])(?:\s+|\s*=\s*)[^\s]+")
+_SECRET_ARG_RE = re.compile(
+    r'''(?i)(--?(?:token|password|passwd|secret|api[-_]?key|authorization)\b|'''
+    r'''(?:token|password|passwd|secret|api[-_]?key|authorization)\b)'''
+    r'''(?:\s*[:=]\s*|\s+)'''
+    r'''(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)'''
+)
 _UNSET = object()
 
 
-def truncate(value: Any, limit: int = 700) -> str:
+def safe_text(value: Any, limit: int = 700, *, compact: bool = True) -> str:
+    """Normalize, redact known credentials, then bound arbitrary outbound text."""
     text = "" if value is None else str(value)
-    text = " ".join(text.replace("\x00", "").split())
+    text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = redact(text)
+    text = _SECRET_ARG_RE.sub(r"\1 [REDACTED]", text)
+    if compact:
+        text = " ".join(text.split())
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def truncate(value: Any, limit: int = 700) -> str:
+    return safe_text(value, limit)
 
 
 def safe_command(value: Any, limit: int = 700) -> str:
@@ -29,8 +43,7 @@ def safe_command(value: Any, limit: int = 700) -> str:
                 break
         else:
             value = "operation"
-    text = _SECRET_ARG_RE.sub(r"\1 [REDACTED]", truncate(value, limit))
-    return truncate(text, limit)
+    return safe_text(value, limit)
 
 
 def project_name(cwd: Any = None, session_id: Any = None) -> str:
@@ -56,7 +69,7 @@ def project_name(cwd: Any = None, session_id: Any = None) -> str:
         name = path.name or path.parent.name
     except (OSError, ValueError):
         name = "unknown"
-    return truncate(name or "unknown", 80)
+    return safe_text(name or "unknown", 80)
 
 
 def _stored_session_title(session_id: Any) -> str:
@@ -76,7 +89,7 @@ def _stored_session_title(session_id: Any) -> str:
 
         with SessionDB(read_only=True) as session_db:
             title = session_db.get_session_title(value)
-        return redact(title or "").strip()
+        return safe_text(title or "", 120)
     except Exception:
         return ""
 
@@ -108,9 +121,9 @@ def _stored_session_metadata(session_id: Any) -> dict[str, str]:
 
 def _profile_label(explicit: Any, stored: Any) -> str:
     for candidate in (explicit, stored):
-        value = redact(candidate or "").strip()
+        value = safe_text(candidate or "", 80)
         if value:
-            return truncate(value, 80)
+            return value
     try:
         from hermes_constants import get_hermes_home, profile_name_for_home
 
@@ -119,36 +132,16 @@ def _profile_label(explicit: Any, stored: Any) -> str:
         return "default"
 
 
-def _derived_session_title(user_message: Any, title_preview: Any = None) -> str:
-    """Mirror Hermes' instant title for the first turn, before its DB write runs."""
-    if not isinstance(user_message, str) or not user_message.strip():
-        return ""
-    try:
-        from agent.title_generator import derive_title, is_titleable_user_message
-
-        if not is_titleable_user_message(user_message):
-            return ""
-        preview = title_preview if isinstance(title_preview, str) else None
-        return str(derive_title(user_message, preview) or "").strip()
-    except Exception:
-        return ""
-
-
 def session_name(
     *, session_id: Any = None, explicit: Any = None, stored_title: Any = _UNSET,
-    user_message: Any = None, is_first_turn: bool = False, title_preview: Any = None,
 ) -> str:
     """Return a safe human-readable session name without exposing raw IDs."""
     if stored_title is _UNSET:
         stored_title = _stored_session_title(session_id)
     for candidate in (explicit, stored_title):
-        value = redact(candidate or "").strip()
+        value = safe_text(candidate or "", 120)
         if value and value.casefold() != "new session":
-            return truncate(value, 120)
-    if is_first_turn:
-        value = redact(_derived_session_title(user_message, title_preview)).strip()
-        if value:
-            return truncate(value, 120)
+            return value
     return "New session"
 
 
@@ -161,7 +154,7 @@ def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int, body: str 
     for label, value in fields:
         if value is None or value == "":
             continue
-        output.append(f"{label}: {truncate(value, 700)}")
+        output.append(f"{safe_text(label, 80)}: {safe_text(value, 700)}")
     if body:
         output.extend(("", body))
     message = "\n".join(output)
@@ -173,42 +166,36 @@ def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int, body: str 
 def started(
     *, session_id: Any = None, session_name_value: Any = None, profile_name_value: Any = None,
     task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None,
-    user_message: Any = None, is_first_turn: bool = False, title_preview: Any = None,
+    include_project: bool = True, include_session: bool = True,
     max_chars: int = 3900,
 ) -> str:
-    del task_id, turn_id, model
+    del task_id, turn_id
     metadata = _stored_session_metadata(session_id)
-    session_title = session_name(
-        session_id=session_id,
-        explicit=session_name_value,
-        stored_title=metadata.get("title", ""),
-        user_message=user_message,
-        is_first_turn=is_first_turn,
-        title_preview=title_preview,
-    )
+    fields: list[tuple[str, Any]] = []
+    if include_project:
+        fields.append(("📁 Project", project_name(cwd or metadata.get("cwd"))))
+    fields.append(("👤 Profile", _profile_label(profile_name_value, metadata.get("profile_name"))))
+    if include_session:
+        fields.append((
+            "📝 Session",
+            session_name(session_id=session_id, explicit=session_name_value, stored_title=metadata.get("title", "")),
+        ))
+    if model:
+        fields.append(("Model", model))
     return _lines(
         "🚀 Hermes · Started",
-        [
-            ("📁 Project", project_name(cwd or metadata.get("cwd"))),
-            ("👤 Profile", _profile_label(profile_name_value, metadata.get("profile_name"))),
-            ("📝 Session", session_title),
-        ],
+        fields,
         max_chars,
     )
 
 
 def safe_response(value: Any, limit: int = 3200) -> str:
     """Bound and redact final assistant text before sending it to Telegram."""
-    text = "" if value is None else str(value)
-    text = text.replace("\x00", "").strip()
-    text = redact(text)
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 1)].rstrip() + "…"
+    return safe_text(value, limit, compact=False)
 
 
-def completion(*, status: str, session_id: Any = None, session_name_value: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, reason: Any = None, elapsed_seconds: Any = None, response: Any = None, response_max_chars: int = 3200, max_chars: int = 3900) -> str:
-    del task_id, turn_id, model, elapsed_seconds
+def completion(*, status: str, session_id: Any = None, session_name_value: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, include_project: bool = True, include_session: bool = True, reason: Any = None, elapsed_seconds: Any = None, response: Any = None, response_max_chars: int = 3200, max_chars: int = 3900) -> str:
+    del task_id, turn_id, elapsed_seconds
     status = str(status or "failed").lower()
     title = {
         "completed": "✅ Hermes · Completed",
@@ -216,30 +203,40 @@ def completion(*, status: str, session_id: Any = None, session_name_value: Any =
         "failed": "❌ Hermes · Failed",
     }.get(status, "ℹ️ Hermes · Finished")
     body = safe_response(response, response_max_chars) if status == "completed" else ""
-    fields: list[tuple[str, Any]] = [
-        ("Project", project_name(cwd, session_id)),
-        _session_field(session_id, session_name_value),
-    ]
+    fields: list[tuple[str, Any]] = []
+    if include_project:
+        fields.append(("Project", project_name(cwd, session_id)))
+    if include_session:
+        fields.append(_session_field(session_id, session_name_value))
+    if model:
+        fields.append(("Model", model))
     if reason and not body:
         fields.append(("Reason", reason))
     return _lines(title, fields, max_chars, body)
 
 
-def approval(*, command: Any = None, description: Any = None, session_id: Any = None, session_name_value: Any = None, session_key: Any = None, turn_id: Any = None, cwd: Any = None, surface: Any = None, max_chars: int = 3900) -> str:
+def approval(*, command: Any = None, description: Any = None, session_id: Any = None, session_name_value: Any = None, session_key: Any = None, turn_id: Any = None, cwd: Any = None, surface: Any = None, include_project: bool = True, include_session: bool = True, max_chars: int = 3900) -> str:
     del session_key, turn_id, surface
-    fields = [
-        ("Project", project_name(cwd, session_id)),
-        _session_field(session_id, session_name_value),
-        ("Command", safe_command(command)),
-    ]
+    fields = []
+    if include_project:
+        fields.append(("Project", project_name(cwd, session_id)))
+    if include_session:
+        fields.append(_session_field(session_id, session_name_value))
+    fields.append(("Command", safe_command(command)))
     if description:
-        fields.append(("Reason", truncate(description, 500)))
+        fields.append(("Reason", safe_text(description, 500)))
     return _lines("⚠️ Hermes · Approval required", fields, max_chars)
 
 
-def approval_response(*, choice: Any = None, command: Any = None, session_id: Any = None, session_name_value: Any = None, session_key: Any = None, turn_id: Any = None, decided_by: Any = None, max_chars: int = 3900) -> str:
+def approval_response(*, choice: Any = None, command: Any = None, session_id: Any = None, session_name_value: Any = None, session_key: Any = None, turn_id: Any = None, decided_by: Any = None, include_session: bool = True, max_chars: int = 3900) -> str:
     del session_key, turn_id
     value = str(choice or "unknown").replace("_", "-")
+    allowed_choices = {
+        "once", "session", "always", "deny", "timeout", "cancelled", "notify-failed",
+        "smart-approve", "smart-deny", "transport-failure", "unknown", "other",
+    }
+    if value not in allowed_choices:
+        value = "unknown"
     emoji = {
         "once": "✅",
         "session": "✅",
@@ -250,7 +247,10 @@ def approval_response(*, choice: Any = None, command: Any = None, session_id: An
         "smart-approve": "🤖✅",
         "smart-deny": "🤖❌",
     }.get(value, "ℹ️")
-    fields = [_session_field(session_id, session_name_value), ("Command", safe_command(command))]
+    fields = []
+    if include_session:
+        fields.append(_session_field(session_id, session_name_value))
+    fields.append(("Command", safe_command(command)))
     if decided_by:
-        fields.append(("Decided by", decided_by))
+        fields.append(("Decided by", safe_text(decided_by, 80)))
     return _lines(f"{emoji} Hermes · Approval {value}", fields, max_chars)

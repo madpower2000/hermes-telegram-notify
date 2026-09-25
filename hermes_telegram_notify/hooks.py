@@ -32,7 +32,6 @@ def _record(cfg: config_mod.ResolvedConfig, event: str, **fields: Any) -> None:
             cfg.log_path,
             event,
             max_bytes=int(cfg.values.get("log_max_bytes", 524_288)),
-            backup_bytes=int(cfg.values.get("log_backup_bytes", 262_144)),
             **fields,
         )
     except Exception:
@@ -188,7 +187,10 @@ def _send_completion(
         task_id=kwargs.get("task_id"),
         turn_id=kwargs.get("turn_id"),
         model=kwargs.get("model") if cfg.values.get("include_model", True) else None,
-        cwd=kwargs.get("cwd") or kwargs.get("working_directory") if cfg.values.get("include_cwd", True) else None,
+        cwd=(kwargs.get("cwd") or kwargs.get("working_directory"))
+        if cfg.values.get("include_cwd", True) else None,
+        include_project=bool(cfg.values.get("include_cwd", True)),
+        include_session=bool(cfg.values.get("include_session", True)),
         reason=reason,
         elapsed_seconds=elapsed,
         response=response,
@@ -213,20 +215,6 @@ def on_post_llm_call(**kwargs: Any) -> None:
             _record(config_mod.load_config(), "hook_failed", hook="post_llm_call", error=type(exc).__name__)
         except Exception:
             pass
-    return None
-
-
-def _title_preview_from_history(kwargs: dict[str, Any]) -> str | None:
-    preview = kwargs.get("title_preview")
-    if isinstance(preview, str):
-        return preview
-    history = kwargs.get("conversation_history")
-    if isinstance(history, list):
-        for message in reversed(history):
-            if isinstance(message, dict) and message.get("role") == "user":
-                metadata = message.get("display_metadata")
-                value = metadata.get("title_preview") if isinstance(metadata, dict) else None
-                return value if isinstance(value, str) else None
     return None
 
 
@@ -264,9 +252,8 @@ def on_pre_llm_call(**kwargs: Any) -> None:
             turn_id=kwargs.get("turn_id"),
             model=kwargs.get("model") if cfg.values.get("include_model", True) else None,
             cwd=metadata["cwd"] if cfg.values.get("include_cwd", True) else None,
-            user_message=kwargs.get("user_message"),
-            is_first_turn=kwargs.get("is_first_turn") is True,
-            title_preview=_title_preview_from_history(kwargs),
+            include_project=bool(cfg.values.get("include_cwd", True)),
+            include_session=bool(cfg.values.get("include_session", True)),
             max_chars=int(cfg.values.get("max_message_chars", 3900)),
         )
         _notify(cfg, text, "start")
@@ -334,6 +321,8 @@ def on_pre_approval_request(**kwargs: Any) -> None:
             turn_id=kwargs.get("turn_id"),
             cwd=kwargs.get("cwd") or kwargs.get("working_directory"),
             surface=kwargs.get("surface"),
+            include_project=bool(cfg.values.get("include_cwd", True)),
+            include_session=bool(cfg.values.get("include_session", True)),
             max_chars=int(cfg.values.get("max_message_chars", 3900)),
         )
         _notify(cfg, text, "approval", diagnostics=diagnostics)
@@ -371,6 +360,7 @@ def on_post_approval_response(**kwargs: Any) -> None:
             session_key=kwargs.get("session_key"),
             turn_id=kwargs.get("turn_id"),
             decided_by=kwargs.get("decided_by"),
+            include_session=bool(cfg.values.get("include_session", True)),
             max_chars=int(cfg.values.get("max_message_chars", 3900)),
         )
         _notify(cfg, text, "approval_response", diagnostics=diagnostics)

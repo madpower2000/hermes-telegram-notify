@@ -9,6 +9,7 @@ import sys
 from typing import Any
 
 from . import config as config_mod
+from . import formatting
 from . import logging_utils
 from .telegram import TelegramClient, TelegramError, discover_chat_ids
 
@@ -54,8 +55,7 @@ def _configure(args: argparse.Namespace) -> int:
         chat_id = input("Telegram chat ID: ").strip()
     token = ""
     if args.token_env:
-        import os
-        token = os.environ.get(args.token_env, "").strip()
+        token = config_mod.resolve_profile_environment_value(args.token_env)
         if not token:
             print(f"Environment variable {args.token_env} is empty", file=sys.stderr)
             return 2
@@ -81,7 +81,8 @@ def _test(args: argparse.Namespace) -> int:
         print("telegram-notify is not configured (token and chat ID are required)", file=sys.stderr)
         return 2
     try:
-        TelegramClient(cfg.token, int(cfg.values.get("telegram_timeout_seconds", 4))).send_message(cfg.chat_id, args.message[:3900])
+        message = formatting.safe_text(args.message, 3900)
+        TelegramClient(cfg.token, int(cfg.values.get("telegram_timeout_seconds", 4))).send_message(cfg.chat_id, message)
     except TelegramError as exc:
         print(f"Telegram test failed: {exc}", file=sys.stderr)
         return 1

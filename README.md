@@ -6,22 +6,24 @@ needs an approval decision. It is modeled on the operational safeguards in
 [`codex-telegram-notify`](https://github.com/NousResearch/codex-telegram-notify),
 but uses Hermes' public Python plugin API rather than Codex hook scripts.
 
+Current plugin release: [`v1.1.1`](https://github.com/madpower2000/hermes-telegram-notify/releases/tag/v1.1.1).
+
 ## What it does
 
 The plugin registers five observer hooks:
 
 | Hermes hook | Notification |
 |---|---|
-| `pre_llm_call` | One **🚀 Hermes · Started** message per turn, with project, profile, and session title |
-| `post_llm_call` | **✅ Hermes · Completed** plus the final assistant response |
+| `pre_llm_call` | One **🚀 Hermes · Started** message per turn, with configurable project, profile, session, and model metadata |
+| `post_llm_call` | **✅ Hermes · Completed** plus the final assistant response and optional model metadata |
 | `on_session_end` | **⏸️ Interrupted** or **❌ Failed** fallback notification |
 | `pre_approval_request` | **⚠️ Hermes · Approval required** for user-facing prompts; smart assessments are suppressed |
 | `post_approval_response` | Optional decision/timeout message with emoji |
 
 Started messages use the profile-scoped session record for the project, profile,
-and saved title. On a first turn, if Hermes has not persisted its instant title
-yet, the plugin uses the same short title derivation from the first user message;
-it does not send the full prompt as a separate field.
+and saved title. If neither the hook nor the session database has a title, the
+plugin displays `New session`; it does not derive a title from the first prompt
+or depend on Hermes' internal title-generator module.
 
 Start and completion notifications are suppressed only when Hermes reports
 `platform="subagent"`. Parent-session metadata alone is not used to classify
@@ -54,8 +56,9 @@ Telegram into a Hermes input channel.
 
 ## Compatibility and execution modes
 
-- Targeted Hermes API: plugin API v1, tested against Hermes Agent `0.21.5`
-  (release tag `v2026.9.24`, commit `59004a62`).
+- Targeted Hermes API: plugin API v1, tested against the latest stable Hermes
+  Agent `0.21.5` (release tag `v2026.9.24`, commit
+  `f97608f178d1ffeca59860195ab7da295f7c8e5f`).
 - The lifecycle hooks are process-local and therefore work in the Hermes CLI,
   messaging Gateway, and Desktop sessions that use the Gateway backend.
 - Desktop is not a separate hook API: its backend emits the same Gateway/agent
@@ -143,9 +146,15 @@ hermes telegram-notify configure --token-env MY_TELEGRAM_TOKEN --chat-id '<CHAT_
 unset MY_TELEGRAM_TOKEN
 ```
 
-`TELEGRAM_BOT_TOKEN` is also accepted as a process-environment override. The
-plugin reads only that key from the active Hermes `.env` when the process
-environment does not already provide it; it does not copy the value elsewhere.
+`--token-env` resolves the selected key through Hermes' active profile secret
+scope as well; it does not bypass multiplex isolation.
+
+`TELEGRAM_BOT_TOKEN` resolves through Hermes' active profile secret scope. In a
+single-profile process, the normal process environment and profile `.env` remain
+supported. In a multiplex gateway, the active profile scope is authoritative:
+a secondary profile never falls back to the launch/default profile's
+`os.environ` token. A scoped miss can use only that profile's `credentials.json`
+or remain unconfigured; an unscoped read fails closed.
 
 ## Discovering a chat ID
 
@@ -163,8 +172,9 @@ bot token or raw Telegram update payloads. Set the selected ID with:
 hermes telegram-notify configure --chat-id '<CHAT_ID>'
 ```
 
-The following environment variables override the stored chat ID (first
-non-empty value wins):
+These environment variables override the stored chat ID (first non-empty value
+wins in single-profile mode; under multiplexing, the process-global
+`HERMES_TELEGRAM_CHAT_ID` alias is ignored and the others are profile-scoped):
 
 ```text
 HERMES_TELEGRAM_CHAT_ID
@@ -172,6 +182,21 @@ TELEGRAM_CHAT_ID
 CODEX_TELEGRAM_CHAT_ID       # compatibility with codex-telegram-notify
 TELEGRAM_HOME_CHANNEL        # Hermes home-channel compatibility
 ```
+
+Hermes classifies the `HERMES_TELEGRAM_` prefix as process-global. Accordingly,
+`HERMES_TELEGRAM_CHAT_ID` is supported only in single-profile execution and is
+ignored under multiplexing, even if a profile `.env` happens to contain it. Use
+`TELEGRAM_CHAT_ID`, `CODEX_TELEGRAM_CHAT_ID`, `TELEGRAM_HOME_CHANNEL`, or the
+profile's `telegram_chat_id` setting for a multiplexed profile destination.
+
+Environment scope classification:
+
+| Scope | Variables |
+|---|---|
+| Profile secret | `TELEGRAM_BOT_TOKEN` |
+| Profile configuration | `TELEGRAM_CHAT_ID`, `CODEX_TELEGRAM_CHAT_ID`, `TELEGRAM_HOME_CHANNEL` |
+| Profile-scoped compatibility toggles | `CODEX_TELEGRAM_NOTIFY_ENABLED`, `CODEX_TELEGRAM_PERMISSION_ALERTS` |
+| Process-global (single-profile only for chat ID) | `HERMES_TELEGRAM_CHAT_ID`, `HERMES_TELEGRAM_NOTIFY_*`, `HERMES_TELEGRAM_APPROVAL_DEBOUNCE`, `HERMES_TELEGRAM_TIMEOUT` |
 
 ## Configuration
 
@@ -197,11 +222,16 @@ The supported keys are:
   "final_response_max_chars": 3200,
   "telegram_timeout_seconds": 4,
   "state_retention_days": 7,
+  "log_max_bytes": 524288,
   "include_model": true,
   "include_cwd": true,
   "include_session": true
 }
 ```
+
+The old `log_backup_bytes` field is unsupported and ignored. Rotation keeps one
+backup; `log_max_bytes` controls the active-file rollover threshold and the
+resulting backup size.
 
 Use the management command for the common configuration path. To disable all
 notifications without uninstalling:
@@ -210,9 +240,14 @@ notifications without uninstalling:
 HERMES_TELEGRAM_NOTIFY_ENABLED=0 hermes telegram-notify status
 ```
 
-For a persistent setting, edit `config.json` with a local editor or use the
-plugin's `configure --disable` command. Environment overrides are useful for
-service-level toggles and are not written by the plugin.
+For a persistent per-profile setting, edit `config.json` with a local editor
+or use the plugin's `configure --disable` command. The
+`HERMES_TELEGRAM_NOTIFY_*`, `HERMES_TELEGRAM_APPROVAL_DEBOUNCE`, and
+`HERMES_TELEGRAM_TIMEOUT` variables are process-global tuning under Hermes'
+current secret-scope policy; in a multiplex gateway they apply to the process,
+not one profile. Use `config.json` for profile-specific settings. The legacy
+`CODEX_TELEGRAM_NOTIFY_ENABLED` and `CODEX_TELEGRAM_PERMISSION_ALERTS` aliases
+are profile-scoped.
 
 Event-level environment overrides:
 
@@ -233,7 +268,8 @@ Send one bounded test message:
 hermes telegram-notify test
 ```
 
-A custom short message is allowed, but the command truncates it:
+A custom short message is allowed; before delivery the command normalizes it,
+redacts known credential patterns, and truncates it:
 
 ```bash
 hermes telegram-notify test --message 'Hermes notification test'
@@ -246,10 +282,13 @@ hermes telegram-notify logs --tail 50
 ```
 
 The log is stored at `$HERMES_HOME/telegram-notify/telegram-notify.log`,
-rotated at a bounded size, and written without token-bearing fields. Approval
-diagnostics record a bounded surface category, outcome, timestamp, and opaque
-correlation ID; commands, descriptions, and raw session/tool-call IDs are never
-recorded. Hermes' own logs can also be viewed with:
+rotated at a bounded size, and created with mode `0600` independently of the
+process umask. The rotated backup is also restricted to `0600`. Loggers are
+keyed by normalized profile log path, so one multiplexed profile cannot redirect
+another profile's records. Approval diagnostics record a bounded surface
+category, outcome, timestamp, and opaque correlation ID; commands, descriptions,
+and raw session/tool-call IDs are never recorded. Hermes' own logs can also be
+viewed with:
 
 ```bash
 hermes logs --level INFO
@@ -258,21 +297,23 @@ hermes logs --level INFO
 ## Message safety and formatting
 
 Messages identify Hermes explicitly and stay compact. Start messages contain
-the project identity and the human-readable Hermes session title. When the
-hook does not carry a title, the plugin reads it best-effort from the active
-profile's `state.db`; a genuinely untitled session is shown as `New session`
-rather than exposing a raw technical ID. Successful completion messages contain
-the project identity, session title, and the bounded final assistant response.
-Approval messages contain a sanitized command and optional reason.
-Interrupted/failed messages contain the project, session title, and a short
-reason. Turn IDs, model names, and elapsed timing are intentionally omitted
-from Telegram messages. In a named profile, the profile name (for example,
-`zorro`) is used as the project identity when Hermes does not provide an
-explicit working directory. The plugin never sends full prompts,
-conversation history, environment dumps, model reasoning, or unrestricted
-command output. Common secret-bearing command arguments (`token`,
-`password`, `secret`, `api-key`, authorization) and token-shaped values in the
-final response are redacted.
+the project identity, human-readable session title, and model metadata by
+default. `include_cwd` controls whether the project/workspace identity is shown
+(not whether a raw path is sent); `include_session` controls session titles;
+`include_model` controls model labels in start/completion notices. Each option is
+honored by the emitted Telegram text. When no explicit or stored title exists,
+the plugin shows `New session` rather than exposing a raw technical ID or
+deriving a title from the prompt. Successful completion messages contain the
+bounded final assistant response. Approval messages contain a sanitized command
+and optional reason; interrupted/failed messages contain a short reason. Turn
+IDs and elapsed timing are omitted. In a named profile, the profile name (for
+example, `zorro`) is used as the project identity when Hermes does not provide
+an explicit working directory. All arbitrary free text sent to Telegram is
+normalized, redacted, and bounded, including approval descriptions, failure and
+interruption reasons, titles, project/profile labels, model labels, commands,
+decision metadata, and successful final responses. The plugin never sends full
+prompts, conversation history, environment dumps, model reasoning, or
+unrestricted command output.
 
 ## State, locking, and duplicate suppression
 

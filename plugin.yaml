@@ -1,5 +1,5 @@
 name: telegram-notify
-version: "1.1.0"
+version: "1.1.1"
 description: "Sends compact Hermes lifecycle notifications to Telegram."
 author: "madpower2000"
 license: MIT
@@ -18,6 +18,9 @@ optional_env:
   - TELEGRAM_CHAT_ID
   - HERMES_TELEGRAM_CHAT_ID
   - TELEGRAM_HOME_CHANNEL
+  - CODEX_TELEGRAM_CHAT_ID
+  - CODEX_TELEGRAM_NOTIFY_ENABLED
+  - CODEX_TELEGRAM_PERMISSION_ALERTS
 tags:
   - notifications
   - telegram

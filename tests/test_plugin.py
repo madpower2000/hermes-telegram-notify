@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import multiprocessing
 import os
+import shutil
+import stat
 import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -12,13 +15,13 @@ from unittest.mock import Mock, patch
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-HERMES_SRC = Path("/home/max/.hermes/hermes-agent")
+HERMES_SRC = Path(os.environ.get("HERMES_SRC", "/home/max/.hermes/hermes-agent"))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if HERMES_SRC.exists() and str(HERMES_SRC) not in sys.path:
     sys.path.insert(0, str(HERMES_SRC))
 
-from hermes_telegram_notify import config, formatting, hooks  # noqa: E402
+from hermes_telegram_notify import cli, config, formatting, hooks  # noqa: E402
 from hermes_telegram_notify.state import StateStore  # noqa: E402
 from hermes_telegram_notify.telegram import TelegramClient, TelegramError  # noqa: E402
 
@@ -31,9 +34,11 @@ def hermes_home(tmp_path, monkeypatch):
     for name in (
         "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "HERMES_TELEGRAM_CHAT_ID",
         "TELEGRAM_HOME_CHANNEL", "CODEX_TELEGRAM_CHAT_ID",
+        "CODEX_TELEGRAM_NOTIFY_ENABLED", "CODEX_TELEGRAM_PERMISSION_ALERTS",
         "HERMES_TELEGRAM_NOTIFY_ENABLED", "HERMES_TELEGRAM_NOTIFY_START",
         "HERMES_TELEGRAM_NOTIFY_COMPLETION", "HERMES_TELEGRAM_NOTIFY_APPROVAL",
         "HERMES_TELEGRAM_NOTIFY_APPROVAL_RESPONSE",
+        "HERMES_TELEGRAM_APPROVAL_DEBOUNCE", "HERMES_TELEGRAM_TIMEOUT",
     ):
         monkeypatch.delenv(name, raising=False)
     return home
@@ -60,6 +65,133 @@ def test_config_defaults_and_environment_override(hermes_home, monkeypatch):
     assert cfg.event_enabled("approval") is False
 
 
+def test_multiplex_secondary_secret_scope_beats_ambient_default(hermes_home, monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "default-profile-sentinel")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "default-chat-sentinel")
+    monkeypatch.setenv("HERMES_TELEGRAM_CHAT_ID", "default-prefixed-chat-sentinel")
+    scope = {
+        "TELEGRAM_BOT_TOKEN": "secondary-profile-sentinel",
+        "TELEGRAM_CHAT_ID": "secondary-profile-chat",
+        # Hermes' HERMES_TELEGRAM_ prefix is process-global and is not a
+        # profile-scoped destination, even if present in a raw .env mapping.
+        "HERMES_TELEGRAM_CHAT_ID": "secondary-hermes-chat",
+    }
+    token = secret_scope.set_secret_scope(scope, profile_home=str(hermes_home))
+    try:
+        cfg = config.load_config()
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert cfg.token == "secondary-profile-sentinel"
+    assert cfg.chat_id == "secondary-profile-chat"
+    assert "default-profile-sentinel" not in cfg.token
+    assert "default-prefixed-chat-sentinel" not in cfg.chat_id
+
+
+def test_multiplex_scoped_miss_does_not_borrow_ambient_credentials(hermes_home, monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "default-profile-sentinel")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "default-chat-sentinel")
+    monkeypatch.setenv("HERMES_TELEGRAM_CHAT_ID", "default-prefixed-chat-sentinel")
+    monkeypatch.setenv("CODEX_TELEGRAM_CHAT_ID", "default-legacy-chat-sentinel")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "default-home-channel-sentinel")
+    token = secret_scope.set_secret_scope({}, profile_home=str(hermes_home))
+    try:
+        cfg = config.load_config()
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert cfg.token == ""
+    assert cfg.chat_id == ""
+    assert cfg.configured is False
+
+
+def test_hermes_notification_tuning_remains_process_global(hermes_home, monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("HERMES_TELEGRAM_NOTIFY_ENABLED", "0")
+    scope = {
+        "TELEGRAM_BOT_TOKEN": "secondary-profile-sentinel",
+        "TELEGRAM_CHAT_ID": "secondary-profile-chat",
+        "HERMES_TELEGRAM_NOTIFY_ENABLED": "1",
+    }
+    token = secret_scope.set_secret_scope(scope, profile_home=str(hermes_home))
+    try:
+        cfg = config.load_config()
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    # Hermes classifies the HERMES_TELEGRAM_ prefix as process-global tuning;
+    # profile-specific persistent settings remain in config.json.
+    assert cfg.enabled is False
+
+
+def test_multiplex_without_secret_scope_fails_closed(hermes_home, monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "default-profile-sentinel")
+    scope_token = secret_scope.set_secret_scope(None)
+    try:
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            config.load_config()
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+
+
+def test_single_profile_still_accepts_environment_credentials(hermes_home, monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "single-profile-sentinel")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "single-profile-chat")
+    cfg = config.load_config()
+    assert cfg.token == "single-profile-sentinel"
+    assert cfg.chat_id == "single-profile-chat"
+
+
+def test_cli_token_env_resolves_from_active_profile_scope(hermes_home, monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("MY_TELEGRAM_TOKEN", "default-profile-sentinel")
+    scope_token = secret_scope.set_secret_scope(
+        {"MY_TELEGRAM_TOKEN": "secondary-profile-sentinel"},
+        profile_home=str(hermes_home),
+    )
+    try:
+        assert config.resolve_profile_environment_value("MY_TELEGRAM_TOKEN") == "secondary-profile-sentinel"
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+
+
+def test_cli_token_env_rejects_hermes_global_name_in_multiplex(hermes_home, monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setenv("HERMES_TELEGRAM_BOT_TOKEN", "default-profile-sentinel")
+    scope_token = secret_scope.set_secret_scope(
+        {"HERMES_TELEGRAM_BOT_TOKEN": "secondary-profile-sentinel"},
+        profile_home=str(hermes_home),
+    )
+    try:
+        assert config.resolve_profile_environment_value("HERMES_TELEGRAM_BOT_TOKEN") == ""
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+
+
+def test_log_backup_bytes_is_no_longer_supported_configuration(hermes_home):
+    assert "log_backup_bytes" not in config.DEFAULTS
+    with pytest.raises(ValueError, match="unknown configuration key"):
+        config.save_config({"log_backup_bytes": 100})
+
+
 def test_config_missing_and_secret_file_permissions(hermes_home, monkeypatch):
     cfg = config.load_config()
     assert not cfg.configured
@@ -82,10 +214,95 @@ def test_token_is_not_in_status_or_log(hermes_home, monkeypatch, capsys):
     assert token not in log_text
 
 
+def test_cli_test_message_redacts_credentials_before_telegram_send(hermes_home, monkeypatch, capsys):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(cli, "TelegramClient", lambda *a, **k: sender)
+    message = (
+        "Status 987654:synthetic_test_value_only_not_real; "
+        "Bearer synthetic_bearer_value_only_not_real; still useful"
+    )
+
+    assert cli._test(argparse.Namespace(message=message)) == 0
+    assert capsys.readouterr().out == "Telegram test notification sent\n"
+    sent = sender.send_message.call_args.args[1]
+    assert "987654:synthetic_test_value_only_not_real" not in sent
+    assert "synthetic_bearer_value_only_not_real" not in sent
+    assert "Status" in sent and "still useful" in sent
+
+
 def test_redaction_covers_numeric_bot_tokens():
     from hermes_telegram_notify.logging_utils import redact
     assert "123456:abcdefghijklmnopqrstuv" not in redact("error 123456:abcdefghijklmnopqrstuv")
     assert "[REDACTED]" in redact("error 123456:abcdefghijklmnopqrstuv")
+
+
+def test_log_creation_rotation_and_permissions_are_secure(tmp_path):
+    from hermes_telegram_notify import logging_utils
+
+    path = tmp_path / "telegram-notify.log"
+    old_umask = os.umask(0o022)
+    try:
+        log = logging_utils.configure_logging(path, max_bytes=1)
+        assert path.exists()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        log.info("first diagnostic")
+        log.info("second diagnostic triggers rotation")
+        backup = path.with_name(path.name + ".1")
+        assert backup.exists()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    finally:
+        os.umask(old_umask)
+
+
+def test_log_max_bytes_reconfiguration_updates_existing_handler(tmp_path):
+    from hermes_telegram_notify import logging_utils
+
+    path = tmp_path / "telegram-notify.log"
+    log = logging_utils.configure_logging(path, max_bytes=1024)
+    handler = next(
+        h for h in log.handlers if isinstance(h, logging_utils._SecureRotatingFileHandler)
+    )
+    assert handler.maxBytes == 1024
+
+    logging_utils.configure_logging(path, max_bytes=64)
+    assert handler.maxBytes == 64
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="platform has no O_NOFOLLOW")
+def test_logger_rejects_symlinked_log_file(tmp_path):
+    from hermes_telegram_notify import logging_utils
+
+    target = tmp_path / "outside.log"
+    target.write_text("leave this target alone", encoding="utf-8")
+    target.chmod(0o644)
+    link = tmp_path / "telegram-notify.log"
+    link.symlink_to(target)
+
+    with pytest.raises(OSError):
+        logging_utils.configure_logging(link)
+    assert target.read_text(encoding="utf-8") == "leave this target alone"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_profile_loggers_cannot_cross_write(tmp_path):
+    from hermes_telegram_notify import logging_utils
+
+    path_a = tmp_path / "profile-a" / "telegram-notify.log"
+    path_b = tmp_path / "profile-b" / "telegram-notify.log"
+    log_a = logging_utils.configure_logging(path_a)
+    log_b = logging_utils.configure_logging(path_b)
+
+    # Reconfigure B between A's handler selection and its actual write. A
+    # process-global mutable logger used to route this A record into B's file.
+    log_a.info("only-profile-a")
+    log_b.info("only-profile-b")
+
+    assert "only-profile-a" in path_a.read_text(encoding="utf-8")
+    assert "only-profile-a" not in path_b.read_text(encoding="utf-8")
+    assert "only-profile-b" in path_b.read_text(encoding="utf-8")
+    assert "only-profile-b" not in path_a.read_text(encoding="utf-8")
 
 
 def test_telegram_request_generation_and_success():
@@ -131,6 +348,35 @@ def test_formatting_truncates_and_redacts():
     assert "project" in text
 
 
+def test_safe_text_redacts_credentials_and_preserves_surrounding_text():
+    text = formatting.safe_text(
+        "Approval context 987654:synthetic_test_value_only_not_real and "
+        "Bearer synthetic_bearer_value_only_not_real remain useful", 200,
+    )
+    assert "987654:synthetic_test_value_only_not_real" not in text
+    assert "synthetic_bearer_value_only_not_real" not in text
+    assert "Approval context" in text
+    assert "remain useful" in text
+
+
+def test_safe_text_redacts_secret_assignments_and_quoted_command_arguments():
+    context = formatting.safe_text(
+        'setup password="synthetic phrase secret" and api_key=synthetic-api-value',
+    )
+    command = formatting.safe_command(
+        'run --password "synthetic phrase secret" --token=synthetic-token-value',
+    )
+    for secret in (
+        "synthetic phrase secret",
+        "synthetic-api-value",
+        "synthetic-token-value",
+    ):
+        assert secret not in context
+        assert secret not in command
+    assert "setup" in context
+    assert "run" in command
+
+
 def test_start_event_is_deduplicated(hermes_home, monkeypatch):
     configure(hermes_home, monkeypatch)
     sender = Mock()
@@ -143,6 +389,90 @@ def test_start_event_is_deduplicated(hermes_home, monkeypatch):
     assert "📁 Project: zorro" in text
     assert "👤 Profile: default" in text
     assert "📝 Session: New session" in text
+
+
+@pytest.mark.parametrize(
+    ("setting", "event"),
+    [
+        ("enabled", "start"),
+        ("notify_on_start", "start"),
+        ("notify_on_completion", "completion"),
+        ("notify_on_approval", "approval"),
+        ("notify_on_approval_response", "approval_response"),
+    ],
+)
+@pytest.mark.parametrize("value", [False, True])
+def test_notification_boolean_settings_change_telegram_output(
+    hermes_home, monkeypatch, setting, event, value,
+):
+    configure(hermes_home, monkeypatch, **{setting: value})
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    identity = f"{setting}-{value}"
+
+    if event == "start":
+        hooks.on_pre_llm_call(session_id=identity, turn_id=identity, cwd="/tmp/project")
+    elif event == "completion":
+        hooks.on_session_end(
+            session_id=identity, turn_id=identity,
+            completed=True, failed=False, interrupted=False,
+        )
+    elif event == "approval":
+        hooks.on_pre_approval_request(
+            session_id=identity, session_key=identity, turn_id=identity,
+            tool_call_id=identity, command="git status", surface="gateway",
+        )
+    else:
+        hooks.on_post_approval_response(
+            session_id=identity, session_key=identity, turn_id=identity,
+            tool_call_id=identity, choice="once",
+        )
+
+    assert sender.send_message.call_count == int(value)
+    if value:
+        text = sender.send_message.call_args.args[1]
+        assert text
+
+
+@pytest.mark.parametrize("include_model", [False, True])
+def test_include_model_controls_start_and_completion_text(hermes_home, monkeypatch, include_model):
+    configure(hermes_home, monkeypatch, include_model=include_model)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_pre_llm_call(
+        session_id="model-start", turn_id="model-start", model="provider/model-test",
+    )
+    hooks.on_session_end(
+        session_id="model-end", turn_id="model-end", model="provider/model-test",
+        completed=True, failed=False, interrupted=False,
+    )
+    texts = [call.args[1] for call in sender.send_message.call_args_list]
+    assert len(texts) == 2
+    assert all(("Model: provider/model-test" in text) is include_model for text in texts)
+
+
+@pytest.mark.parametrize("include_cwd", [False, True])
+def test_include_cwd_controls_project_identity_in_telegram_text(hermes_home, monkeypatch, include_cwd):
+    configure(hermes_home, monkeypatch, include_cwd=include_cwd)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_pre_llm_call(
+        session_id="cwd-test", turn_id="cwd-test", cwd="/home/operator/private-project",
+    )
+    text = sender.send_message.call_args.args[1]
+    assert ("Project: private-project" in text) is include_cwd
+
+
+@pytest.mark.parametrize("include_session", [False, True])
+def test_include_session_controls_session_text(hermes_home, monkeypatch, include_session):
+    configure(hermes_home, monkeypatch, include_session=include_session)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_pre_llm_call(
+        session_id="session-toggle", turn_id="session-toggle", session_name="Visible title",
+    )
+    text = sender.send_message.call_args.args[1]
+    assert ("Session: Visible title" in text) is include_session
 
 
 def test_started_message_prefers_stored_profile_and_session_title(hermes_home, monkeypatch):
@@ -173,7 +503,7 @@ def test_started_message_prefers_stored_profile_and_session_title(hermes_home, m
     ]
 
 
-def test_started_message_uses_hermes_derived_title_before_title_persists(hermes_home, monkeypatch):
+def test_started_message_uses_new_session_when_title_is_not_persisted(hermes_home, monkeypatch):
     configure(hermes_home, monkeypatch)
     sender = Mock()
     monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
@@ -182,9 +512,6 @@ def test_started_message_uses_hermes_derived_title_before_title_persists(hermes_
         "_stored_session_metadata",
         lambda _sid: {"cwd": "/home/max/Projects/Tripwire", "profile_name": "zorro", "title": ""},
     )
-    derived = Mock(return_value="Tripwire event-study research")
-    monkeypatch.setattr(formatting, "_derived_session_title", derived)
-
     hooks.on_pre_llm_call(
         session_id="sid", task_id="task", turn_id="turn",
         user_message="Analyze the Tripwire event study", is_first_turn=True,
@@ -196,8 +523,9 @@ def test_started_message_uses_hermes_derived_title_before_title_persists(hermes_
     text = sender.send_message.call_args.args[1]
     assert "📁 Project: Tripwire" in text
     assert "👤 Profile: zorro" in text
-    assert "📝 Session: Tripwire event-study research" in text
-    derived.assert_called_once_with("Analyze the Tripwire event study", "Tripwire event-study research")
+    assert "📝 Session: New session" in text
+    assert "Analyze the Tripwire event study" not in text
+    assert "Tripwire event-study research" not in text
 
 
 def test_subagent_start_is_suppressed_before_root_start_claim(hermes_home, monkeypatch):
@@ -288,7 +616,7 @@ def test_completion_statuses(hermes_home, monkeypatch, flags, expected):
     }[expected])
     assert "Session: New session" in text
     assert "Turn:" not in text
-    assert "Model:" not in text
+    assert "Model: m" in text
 
 
 def test_post_llm_sends_final_response_and_session_end_does_not_duplicate(hermes_home, monkeypatch):
@@ -310,6 +638,7 @@ def test_post_llm_sends_final_response_and_session_end_does_not_duplicate(hermes
     assert "Project:" in text
     assert "Final answer from Hermes." in text
     assert "Session: New session" in text
+    assert "Model: m" in text
     assert "Turn:" not in text
 
 
@@ -463,6 +792,58 @@ def test_approval_notification_log_identifies_its_surface(hermes_home, monkeypat
     assert request["approval_id"] == sent["approval_id"]
     assert sent["notification"] == "approval"
     assert "git branch -D example" not in log_path.read_text()
+
+
+def test_approval_description_is_redacted_before_telegram_delivery(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    synthetic_secret = "987654:synthetic_test_value_only_not_real"
+    hooks.on_pre_approval_request(
+        session_key="s", turn_id="t", tool_call_id="c", surface="gateway",
+        command="git status",
+        description=f"Review context {synthetic_secret} and keep this detail",
+    )
+    text = sender.send_message.call_args.args[1]
+    assert synthetic_secret not in text
+    assert "Review context" in text
+    assert "keep this detail" in text
+
+
+@pytest.mark.parametrize(
+    ("failed", "interrupted", "title"),
+    [(True, False, "Failed"), (False, True, "Interrupted")],
+)
+def test_failure_and_interruption_reasons_are_redacted(
+    hermes_home, monkeypatch, failed, interrupted, title,
+):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    synthetic_secret = "987654:synthetic_test_value_only_not_real"
+    hooks.on_session_end(
+        session_id=title, turn_id=title, completed=False, failed=failed,
+        interrupted=interrupted,
+        turn_exit_reason=f"Useful {title.lower()} context {synthetic_secret} remains",
+    )
+    text = sender.send_message.call_args.args[1]
+    assert f"Hermes · {title}" in text
+    assert synthetic_secret not in text
+    assert "Useful" in text and "remains" in text
+
+
+def test_session_title_is_redacted_before_telegram_delivery(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    synthetic_secret = "987654:synthetic_test_value_only_not_real"
+    hooks.on_pre_llm_call(
+        session_id="title-redaction", turn_id="title-redaction",
+        session_title=f"Review {synthetic_secret} is ongoing",
+    )
+    text = sender.send_message.call_args.args[1]
+    assert synthetic_secret not in text
+    assert "Review" in text and "is ongoing" in text
 
 
 def test_malformed_payload_and_disabled_notifications_are_nonfatal(hermes_home, monkeypatch):
@@ -643,6 +1024,84 @@ def test_profiles_do_not_share_credentials_or_state(tmp_path, monkeypatch):
     beta_state = homes["beta"] / "telegram-notify" / "state.json"
     assert alpha_state.exists()
     assert not beta_state.exists()  # beta never claimed a run, so no state file
+
+
+def test_plugin_manager_hook_uses_secondary_profile_secret_scope(tmp_path, monkeypatch):
+    """Load the real plugin and dispatch its real callback under Hermes' scoped runtime."""
+    from agent import secret_scope
+    import hermes_constants
+    from hermes_cli.plugins import PluginManager
+
+    default_token = "default-profile-sentinel"
+    secondary_token = "secondary-profile-sentinel"
+    secondary_chat = "secondary-profile-chat"
+    default_home = tmp_path / ".hermes"
+    secondary_home = default_home / "profiles" / "secondary"
+    secondary_home.mkdir(parents=True)
+    plugins_dir = secondary_home / "plugins"
+    plugin_dir = plugins_dir / "telegram-notify"
+    plugins_dir.mkdir(parents=True)
+    shutil.copytree(
+        ROOT, plugin_dir,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"),
+    )
+    (secondary_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - telegram-notify\n", encoding="utf-8",
+    )
+    (secondary_home / ".env").write_text(
+        f"TELEGRAM_BOT_TOKEN={secondary_token}\n"
+        f"TELEGRAM_CHAT_ID={secondary_chat}\n"
+        "HERMES_TELEGRAM_CHAT_ID=secondary-prefixed-chat\n",
+        encoding="utf-8",
+    )
+    empty_bundled = tmp_path / "empty-bundled"
+    empty_bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(empty_bundled))
+    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", default_token)
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "default-profile-chat")
+    monkeypatch.setenv("HERMES_TELEGRAM_CHAT_ID", "default-prefixed-chat")
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+
+    delivered = []
+
+    class StubTelegramClient:
+        def __init__(self, token, timeout=4):
+            delivered.append({"token": token})
+
+        def send_message(self, chat_id, text):
+            delivered[-1].update(chat_id=chat_id, text=text)
+
+    home_token = hermes_constants.set_hermes_home_override(secondary_home)
+    try:
+        secondary_scope = secret_scope.build_profile_secret_scope(secondary_home)
+        assert secondary_scope["TELEGRAM_BOT_TOKEN"] == secondary_token
+        scope_token = secret_scope.set_secret_scope(
+            secondary_scope, profile_home=str(secondary_home),
+        )
+        manager = PluginManager(scope_key=str(secondary_home))
+        try:
+            manager.discover_and_load()
+            assert manager.has_hook("pre_llm_call")
+            for callback in manager._hooks["pre_llm_call"]:
+                monkeypatch.setitem(callback.__globals__, "TelegramClient", StubTelegramClient)
+            manager.invoke_hook(
+                "pre_llm_call", session_id="multiplex", turn_id="multiplex",
+                cwd="/tmp/secondary-workspace", user_message="safe test message",
+                is_first_turn=True, platform="cli",
+            )
+        finally:
+            manager.unload()
+            secret_scope.reset_secret_scope(scope_token)
+    finally:
+        hermes_constants.reset_hermes_home_override(home_token)
+
+    assert len(delivered) == 1
+    assert delivered[0]["token"] == secondary_token
+    assert delivered[0]["token"] != default_token
+    assert delivered[0]["chat_id"] == secondary_chat
+    assert "Hermes · Started" in delivered[0]["text"]
 
 
 def test_hook_exception_is_fail_open(hermes_home, monkeypatch):
