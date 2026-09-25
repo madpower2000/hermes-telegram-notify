@@ -488,6 +488,171 @@ def test_state_atomic_claim_and_locking(hermes_home):
     assert (root / "state.json").stat().st_mode & 0o077 == 0
 
 
+def test_smart_auto_verdicts_never_send_user_action_alert(hermes_home, monkeypatch):
+    """Smart auto-approve/deny are internal assessments: with the optional
+    approval-response notification disabled (default) nothing may be sent, and
+    in particular no 'Approval required' alert."""
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_key": "s", "turn_id": "t", "tool_call_id": "c",
+        "pattern_key": "dangerous-command",
+        "command": "rm -rf /tmp/example", "description": "needs permission",
+        "surface": "smart",
+    }
+    hooks.on_pre_approval_request(**payload)
+    hooks.on_post_approval_response(**payload, choice="smart_approve", decided_by="aux_llm")
+    hooks.on_post_approval_response(**payload, choice="smart_deny", decided_by="aux_llm")
+    assert sender.send_message.call_count == 0
+
+
+def test_smart_verdict_response_is_informational_when_enabled(hermes_home, monkeypatch):
+    """When the operator enables approval-response notifications, a smart
+    verdict is delivered as an informational message, not an action alert."""
+    configure(hermes_home, monkeypatch, notify_on_approval_response=True)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_post_approval_response(
+        session_key="s", turn_id="t", tool_call_id="c",
+        command="rm -rf /tmp/example", surface="smart",
+        choice="smart_deny", decided_by="aux_llm",
+    )
+    assert sender.send_message.call_count == 1
+    text = sender.send_message.call_args.args[1]
+    assert "Approval required" not in text
+    assert "smart-deny" in text
+    assert "aux_llm" in text
+
+
+def test_approval_response_default_is_off(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_post_approval_response(
+        session_key="s", turn_id="t", tool_call_id="c",
+        command="git push", choice="once",
+    )
+    assert sender.send_message.call_count == 0
+
+
+@pytest.mark.parametrize("surface", ["cli", "gateway", "transport:mytransport", "mcp-elicitation"])
+def test_user_facing_approval_surfaces_notify(hermes_home, monkeypatch, surface):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_pre_approval_request(
+        session_key="s", turn_id=f"t-{surface}", tool_call_id=f"c-{surface}",
+        command="git branch -D example", description="force delete",
+        surface=surface,
+    )
+    assert sender.send_message.call_count == 1
+    assert "Approval required" in sender.send_message.call_args.args[1]
+
+
+def test_coalesced_approval_still_notifies_once_then_debounces(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_key": "s", "turn_id": "t", "tool_call_id": "c",
+        "command": "rm -rf /tmp/example", "description": "needs permission",
+        "surface": "gateway", "coalesced": True,
+    }
+    hooks.on_pre_approval_request(**payload)
+    assert sender.send_message.call_count == 1
+    # A repeated coalesced event in the debounce window is suppressed.
+    hooks.on_pre_approval_request(**payload)
+    assert sender.send_message.call_count == 1
+
+
+def test_malformed_post_approval_payload_is_nonfatal(hermes_home, monkeypatch):
+    """A payload missing every expected key must degrade to safe defaults and
+    never raise — the turn is never broken by a malformed approval event."""
+    configure(hermes_home, monkeypatch, notify_on_approval_response=True)
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: Mock())
+    # All keys absent: the handler must tolerate it, not raise.
+    hooks.on_post_approval_response()
+    # And the observed record must be present, never an uncaught error.
+    log_path = hermes_home / "telegram-notify" / "telegram-notify.log"
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(row.get("event") == "approval_response_observed" for row in records)
+    assert all(row.get("event") != "hook_failed" for row in records)
+
+
+def test_telegram_failure_is_fail_open_at_hook_boundary(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise TelegramError("Telegram network request failed")
+
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: Mock(send_message=boom))
+    # Must not raise; the turn is never aborted by a delivery failure.
+    hooks.on_pre_llm_call(session_id="s", turn_id="t", user_message="hello")
+    hooks.on_post_llm_call(session_id="s", turn_id="t", assistant_response="done")
+    hooks.on_session_end(session_id="s", turn_id="t", completed=False, failed=True, interrupted=False)
+    log_path = hermes_home / "telegram-notify" / "telegram-notify.log"
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert any(row.get("event") == "notification_failed" for row in records)
+    assert all("123456" not in line for line in log_path.read_text().splitlines())
+
+
+def test_missing_chat_id_skips_safely(hermes_home, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:abcdefghijklmnopqrstuv")
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    config.save_config({"telegram_chat_id": "", "enabled": True})
+    assert config.load_config().configured is False
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_pre_llm_call(session_id="s", turn_id="t", user_message="hello")
+    hooks.on_post_llm_call(session_id="s", turn_id="t", assistant_response="done")
+    assert sender.send_message.call_count == 0
+
+
+def test_profiles_do_not_share_credentials_or_state(tmp_path, monkeypatch):
+    """Two HERMES_HOME roots must resolve separate credentials, config, and
+    state — one profile cannot read another profile's stored token or dedupe
+    state. Credentials are written to each profile's own credentials.json
+    (no process env) so the test isolates file-level scoping."""
+    homes = {}
+    for name in ("alpha", "beta"):
+        home = tmp_path / f".hermes-{name}"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        for env in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "HERMES_TELEGRAM_CHAT_ID"):
+            monkeypatch.delenv(env, raising=False)
+        config.save_token(f"123456:{name}{'x' * 13}")
+        config.save_config({"telegram_chat_id": f"100_{name}"})
+        homes[name] = home
+
+    # Load beta with no process token: it must read beta's own credentials,
+    # never alpha's file.
+    monkeypatch.setenv("HERMES_HOME", str(homes["beta"]))
+    beta_cfg = config.load_config()
+    assert beta_cfg.chat_id == "100_beta"
+    assert beta_cfg.configured is True
+    assert beta_cfg.token.endswith("beta" + "x" * 13)
+    assert "alpha" not in beta_cfg.token
+    # Alpha's credentials file must not appear under beta's home.
+    assert "alpha" not in (homes["beta"] / "telegram-notify" / "credentials.json").read_text()
+    # State is written per profile and never shared.
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: Mock())
+    monkeypatch.setenv("HERMES_HOME", str(homes["alpha"]))
+    hooks.on_pre_llm_call(session_id="s", turn_id="t1", user_message="hello")
+    alpha_state = homes["alpha"] / "telegram-notify" / "state.json"
+    beta_state = homes["beta"] / "telegram-notify" / "state.json"
+    assert alpha_state.exists()
+    assert not beta_state.exists()  # beta never claimed a run, so no state file
+
+
+def test_hook_exception_is_fail_open(hermes_home, monkeypatch):
+    """Any internal error in a hook callback must not propagate to Hermes."""
+    monkeypatch.setattr(config, "load_config", Mock(side_effect=RuntimeError("boom")))
+    for callback in (hooks.on_pre_llm_call, hooks.on_post_llm_call, hooks.on_session_end,
+                     hooks.on_pre_approval_request, hooks.on_post_approval_response):
+        callback(session_id="s", turn_id="t")  # must not raise
+
+
 def test_chat_discovery_uses_only_safe_fields(monkeypatch):
     from hermes_telegram_notify.telegram import discover_chat_ids
     client = Mock()

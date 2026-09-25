@@ -1,10 +1,12 @@
 name: telegram-notify
 version: "1.1.0"
 description: "Sends compact Hermes lifecycle notifications to Telegram."
-author: "Hermes Agent community"
+author: "madpower2000"
 license: MIT
+homepage: https://github.com/madpower2000/hermes-telegram-notify
 api_version: 1
 kind: standalone
+requires_hermes: ">=0.21.5"
 provides_hooks:
   - pre_llm_call
   - post_llm_call

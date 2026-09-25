@@ -39,9 +39,23 @@ exclusive state locking, bounded JSONL logs, safe truncation/redaction, chat-ID
 discovery, and a test-message utility. It does **not** import or modify the
 Codex plugin and has no runtime dependency on it.
 
+## Why this plugin instead of local Desktop notifications?
+
+Plugins like `done-bell` and `needs-you` handle **local** awareness: an OS
+chime, a Desktop chip, or a queue page on the machine running Hermes. That is
+the right tool when you are at the machine.
+
+`telegram-notify` is for **remote operator awareness during long-running Hermes
+work**: when you have started a task in the CLI, Gateway, or Desktop and walked
+away, it tells you over Telegram when the *main* agent started, when the turn
+finished (with a bounded final answer), when it failed or was interrupted, and
+when a genuine human approval is required. It is outbound-only and does not turn
+Telegram into a Hermes input channel.
+
 ## Compatibility and execution modes
 
-- Targeted Hermes API: plugin API v1, tested against Hermes `0.20.2`.
+- Targeted Hermes API: plugin API v1, tested against Hermes Agent `0.21.5`
+  (release tag `v2026.9.24`, commit `59004a62`).
 - The lifecycle hooks are process-local and therefore work in the Hermes CLI,
   messaging Gateway, and Desktop sessions that use the Gateway backend.
 - Desktop is not a separate hook API: its backend emits the same Gateway/agent
@@ -67,17 +81,27 @@ Codex plugin and has no runtime dependency on it.
 
 ## Installation
 
-From this repository, use the official Hermes local-plugin installer. The
-installer expects a Git source, so commit the project first:
+From this repository, use the official Hermes local-plugin installer with a Git
+source:
 
 ```bash
-cd /home/max/Projects/hermes-telegram-notify
-git init
-git add .
-git commit -m 'Initial Hermes Telegram notification plugin'
-hermes plugins install file:///home/max/Projects/hermes-telegram-notify --enable
+hermes plugins install https://github.com/madpower2000/hermes-telegram-notify --enable
 hermes plugins doctor telegram-notify
 hermes plugins list
+```
+
+A local checkout works the same way:
+
+```bash
+hermes plugins install file:///home/max/Projects/hermes-telegram-notify --enable
+```
+
+After the plugin is accepted into the Hermes Plugin Catalog, it can be
+installed by name:
+
+```bash
+hermes plugins install telegram-notify
+hermes plugins enable telegram-notify
 ```
 
 The installed copy is normally:
