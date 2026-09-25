@@ -138,8 +138,66 @@ def test_start_event_is_deduplicated(hermes_home, monkeypatch):
     hooks.on_pre_llm_call(session_id="s", task_id="task", turn_id="turn", user_message="hello", cwd="/tmp/zorro")
     hooks.on_pre_llm_call(session_id="s", task_id="task", turn_id="turn", user_message="hello", cwd="/tmp/zorro")
     assert sender.send_message.call_count == 1
-    assert "Hermes · Started" in sender.send_message.call_args.args[1]
-    assert "Session: New session" in sender.send_message.call_args.args[1]
+    text = sender.send_message.call_args.args[1]
+    assert "Hermes · Started" in text
+    assert "📁 Project: zorro" in text
+    assert "👤 Profile: default" in text
+    assert "📝 Session: New session" in text
+
+
+def test_started_message_prefers_stored_profile_and_session_title(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    session_db = Mock()
+    session_db.get_session.return_value = {
+        "cwd": "/home/max/Projects/Tripwire",
+        "profile_name": "quantlab",
+        "title": "Tripwire event-study review",
+    }
+    session_db.__enter__ = Mock(return_value=session_db)
+    session_db.__exit__ = Mock(return_value=False)
+    fake_module = type("FakeHermesState", (), {"SessionDB": Mock(return_value=session_db)})
+
+    with patch.dict(sys.modules, {"hermes_state": fake_module}):
+        hooks.on_pre_llm_call(
+            session_id="sid", task_id="task", turn_id="turn",
+            user_message="This is not the saved title", is_first_turn=True,
+        )
+
+    assert sender.send_message.call_args.args[1].splitlines() == [
+        "🚀 Hermes · Started",
+        "📁 Project: Tripwire",
+        "👤 Profile: quantlab",
+        "📝 Session: Tripwire event-study review",
+    ]
+
+
+def test_started_message_uses_hermes_derived_title_before_title_persists(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    monkeypatch.setattr(
+        formatting,
+        "_stored_session_metadata",
+        lambda _sid: {"cwd": "/home/max/Projects/Tripwire", "profile_name": "zorro", "title": ""},
+    )
+    derived = Mock(return_value="Tripwire event-study research")
+    monkeypatch.setattr(formatting, "_derived_session_title", derived)
+
+    hooks.on_pre_llm_call(
+        session_id="sid", task_id="task", turn_id="turn",
+        user_message="Analyze the Tripwire event study", is_first_turn=True,
+        conversation_history=[
+            {"role": "user", "display_metadata": {"title_preview": "Tripwire event-study research"}},
+        ],
+    )
+
+    text = sender.send_message.call_args.args[1]
+    assert "📁 Project: Tripwire" in text
+    assert "👤 Profile: zorro" in text
+    assert "📝 Session: Tripwire event-study research" in text
+    derived.assert_called_once_with("Analyze the Tripwire event study", "Tripwire event-study research")
 
 
 def test_subagent_start_is_suppressed_before_root_start_claim(hermes_home, monkeypatch):
@@ -169,6 +227,7 @@ def test_named_profile_is_used_as_project_when_cwd_is_absent(tmp_path, monkeypat
     home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     assert formatting.project_name() == "zorro"
+    assert formatting._profile_label(None, None) == "zorro"
 
 
 def test_approval_notification_uses_session_workspace_when_cwd_is_missing(hermes_home, monkeypatch):

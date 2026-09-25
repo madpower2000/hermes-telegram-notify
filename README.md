@@ -12,11 +12,16 @@ The plugin registers five observer hooks:
 
 | Hermes hook | Notification |
 |---|---|
-| `pre_llm_call` | One **🚀 Hermes · Started** message per turn |
+| `pre_llm_call` | One **🚀 Hermes · Started** message per turn, with project, profile, and session title |
 | `post_llm_call` | **✅ Hermes · Completed** plus the final assistant response |
 | `on_session_end` | **⏸️ Interrupted** or **❌ Failed** fallback notification |
 | `pre_approval_request` | **⚠️ Hermes · Approval required** for user-facing prompts; smart assessments are suppressed |
 | `post_approval_response` | Optional decision/timeout message with emoji |
+
+Started messages use the profile-scoped session record for the project, profile,
+and saved title. On a first turn, if Hermes has not persisted its instant title
+yet, the plugin uses the same short title derivation from the first user message;
+it does not send the full prompt as a separate field.
 
 Start and completion notifications are suppressed only when Hermes reports
 `platform="subagent"`. Parent-session metadata alone is not used to classify

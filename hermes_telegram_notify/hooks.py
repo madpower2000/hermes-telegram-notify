@@ -216,6 +216,20 @@ def on_post_llm_call(**kwargs: Any) -> None:
     return None
 
 
+def _title_preview_from_history(kwargs: dict[str, Any]) -> str | None:
+    preview = kwargs.get("title_preview")
+    if isinstance(preview, str):
+        return preview
+    history = kwargs.get("conversation_history")
+    if isinstance(history, list):
+        for message in reversed(history):
+            if isinstance(message, dict) and message.get("role") == "user":
+                metadata = message.get("display_metadata")
+                value = metadata.get("title_preview") if isinstance(metadata, dict) else None
+                return value if isinstance(value, str) else None
+    return None
+
+
 def on_pre_llm_call(**kwargs: Any) -> None:
     try:
         if kwargs.get("platform") == "subagent":
@@ -238,13 +252,21 @@ def on_pre_llm_call(**kwargs: Any) -> None:
         if not store.claim_start(key, metadata):
             _record(cfg, "start_suppressed", reason="duplicate_turn")
             return None
+        profile_name_value = kwargs.get("profile_name")
+        if not isinstance(profile_name_value, str) or not profile_name_value.strip():
+            profile_candidate = kwargs.get("profile")
+            profile_name_value = profile_candidate if isinstance(profile_candidate, str) else None
         text = formatting.started(
             session_id=kwargs.get("session_id"),
             session_name_value=kwargs.get("session_name") or kwargs.get("session_title") or kwargs.get("title"),
+            profile_name_value=profile_name_value,
             task_id=kwargs.get("task_id"),
             turn_id=kwargs.get("turn_id"),
             model=kwargs.get("model") if cfg.values.get("include_model", True) else None,
             cwd=metadata["cwd"] if cfg.values.get("include_cwd", True) else None,
+            user_message=kwargs.get("user_message"),
+            is_first_turn=kwargs.get("is_first_turn") is True,
+            title_preview=_title_preview_from_history(kwargs),
             max_chars=int(cfg.values.get("max_message_chars", 3900)),
         )
         _notify(cfg, text, "start")

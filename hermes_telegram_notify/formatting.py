@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from .logging_utils import redact
 
 _SECRET_ARG_RE = re.compile(r"(?i)(--?(?:token|password|passwd|secret|api[-_]?key|authorization)|(?:token|password|secret|api[-_]?key)\s*[=:])(?:\s+|\s*=\s*)[^\s]+")
+_UNSET = object()
 
 
 def truncate(value: Any, limit: int = 700) -> str:
@@ -34,7 +35,7 @@ def safe_command(value: Any, limit: int = 700) -> str:
 
 def project_name(cwd: Any = None, session_id: Any = None) -> str:
     if not cwd and session_id:
-        cwd = _stored_session_cwd(session_id)
+        cwd = _stored_session_metadata(session_id).get("cwd")
     if not cwd:
         # Gateway services commonly run from the user's home directory rather
         # than the project that owns the conversation. A named Hermes profile
@@ -80,27 +81,72 @@ def _stored_session_title(session_id: Any) -> str:
         return ""
 
 
-def _stored_session_cwd(session_id: Any) -> str:
-    """Resolve a session's recorded workspace when a hook omits its cwd."""
+def _stored_session_metadata(session_id: Any) -> dict[str, str]:
+    """Read only display metadata from the owning profile's session row."""
     value = str(session_id or "").strip()
     if not value:
-        return ""
+        return {}
     session: Any = None
     try:
         from hermes_state import SessionDB
 
         with SessionDB(read_only=True) as session_db:
             session = session_db.get_session(value)
-        cwd = session.get("cwd") if isinstance(session, Mapping) else None
-        return cwd.strip() if isinstance(cwd, str) else ""
+        if not isinstance(session, Mapping):
+            return {}
+
+        def _field(key: str) -> str:
+            field_value = session.get(key)
+            if not isinstance(field_value, str):
+                return ""
+            return field_value.strip() if key == "cwd" else field_value
+
+        return {key: _field(key) for key in ("title", "cwd", "profile_name")}
+    except Exception:
+        return {}
+
+
+def _profile_label(explicit: Any, stored: Any) -> str:
+    for candidate in (explicit, stored):
+        value = redact(candidate or "").strip()
+        if value:
+            return truncate(value, 80)
+    try:
+        from hermes_constants import get_hermes_home, profile_name_for_home
+
+        return truncate(profile_name_for_home(get_hermes_home()) or "default", 80)
+    except Exception:
+        return "default"
+
+
+def _derived_session_title(user_message: Any, title_preview: Any = None) -> str:
+    """Mirror Hermes' instant title for the first turn, before its DB write runs."""
+    if not isinstance(user_message, str) or not user_message.strip():
+        return ""
+    try:
+        from agent.title_generator import derive_title, is_titleable_user_message
+
+        if not is_titleable_user_message(user_message):
+            return ""
+        preview = title_preview if isinstance(title_preview, str) else None
+        return str(derive_title(user_message, preview) or "").strip()
     except Exception:
         return ""
 
 
-def session_name(*, session_id: Any = None, explicit: Any = None) -> str:
+def session_name(
+    *, session_id: Any = None, explicit: Any = None, stored_title: Any = _UNSET,
+    user_message: Any = None, is_first_turn: bool = False, title_preview: Any = None,
+) -> str:
     """Return a safe human-readable session name without exposing raw IDs."""
-    for candidate in (explicit, _stored_session_title(session_id)):
+    if stored_title is _UNSET:
+        stored_title = _stored_session_title(session_id)
+    for candidate in (explicit, stored_title):
         value = redact(candidate or "").strip()
+        if value and value.casefold() != "new session":
+            return truncate(value, 120)
+    if is_first_turn:
+        value = redact(_derived_session_title(user_message, title_preview)).strip()
         if value:
             return truncate(value, 120)
     return "New session"
@@ -124,11 +170,29 @@ def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int, body: str 
     return message[: max(0, max_chars - 1)].rstrip() + "…"
 
 
-def started(*, session_id: Any = None, session_name_value: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, max_chars: int = 3900) -> str:
+def started(
+    *, session_id: Any = None, session_name_value: Any = None, profile_name_value: Any = None,
+    task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None,
+    user_message: Any = None, is_first_turn: bool = False, title_preview: Any = None,
+    max_chars: int = 3900,
+) -> str:
     del task_id, turn_id, model
+    metadata = _stored_session_metadata(session_id)
+    session_title = session_name(
+        session_id=session_id,
+        explicit=session_name_value,
+        stored_title=metadata.get("title", ""),
+        user_message=user_message,
+        is_first_turn=is_first_turn,
+        title_preview=title_preview,
+    )
     return _lines(
         "🚀 Hermes · Started",
-        [("Project", project_name(cwd, session_id)), _session_field(session_id, session_name_value)],
+        [
+            ("📁 Project", project_name(cwd or metadata.get("cwd"))),
+            ("👤 Profile", _profile_label(profile_name_value, metadata.get("profile_name"))),
+            ("📝 Session", session_title),
+        ],
         max_chars,
     )
 
