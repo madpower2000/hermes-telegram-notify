@@ -676,6 +676,64 @@ def test_subagent_completion_is_suppressed_before_root_completion_claim(
     assert expected in sender.send_message.call_args.args[1]
 
 
+def test_telegram_start_is_suppressed_before_root_start_claim(hermes_home, monkeypatch):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_id": "s",
+        "task_id": "task",
+        "turn_id": "turn",
+        "user_message": "hello",
+        "cwd": "/tmp/zorro",
+    }
+
+    # A Telegram-origin session already delivers its reply via the core
+    # gateway, so no Started message must go out.
+    hooks.on_pre_llm_call(**payload, platform="telegram")
+    assert sender.send_message.call_count == 0
+
+    # The ignored Telegram event must not claim the start key for a later
+    # eligible root event with the same identifiers.
+    hooks.on_pre_llm_call(**payload, platform="cli")
+    assert sender.send_message.call_count == 1
+    assert "Hermes · Started" in sender.send_message.call_args.args[1]
+
+
+@pytest.mark.parametrize(
+    ("callback_name", "extra"),
+    [
+        ("on_post_llm_call", {"assistant_response": "Final answer."}),
+        ("on_session_end", {"completed": True, "failed": False, "interrupted": False}),
+        ("on_session_end", {"completed": False, "failed": True, "interrupted": False}),
+        ("on_session_end", {"completed": False, "failed": False, "interrupted": True}),
+    ],
+)
+def test_telegram_completion_is_suppressed_before_root_completion_claim(
+    hermes_home, monkeypatch, callback_name, extra,
+):
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    payload = {
+        "session_id": "s",
+        "task_id": "task",
+        "turn_id": "turn",
+        "model": "m",
+        **extra,
+    }
+
+    callback = getattr(hooks, callback_name)
+    # Telegram-origin completion must not produce a plugin Telegram message.
+    callback(**payload, platform="telegram")
+    assert sender.send_message.call_count == 0
+
+    # The same identity through an eligible platform still completes, proving
+    # suppression happens before the completion claim.
+    callback(**payload, platform="cli")
+    assert sender.send_message.call_count == 1
+
+
 def test_final_response_is_redacted_and_bounded(hermes_home, monkeypatch):
     configure(hermes_home, monkeypatch, final_response_max_chars=80)
     sender = Mock()
@@ -1117,3 +1175,73 @@ def test_chat_discovery_uses_only_safe_fields(monkeypatch):
     client = Mock()
     client.get_updates.return_value = [{"update_id": 1, "message": {"chat": {"id": 42, "title": "Work"}, "text": "secret"}}]
     assert discover_chat_ids(client) == [{"chat_id": "42", "label": "Work"}]
+
+
+@pytest.mark.parametrize(
+    ("session_key", "expected"),
+    [
+        # Gateway shape: agent:<profile>:<platform>:<chat_type>[:...]
+        ("agent:main:telegram:dm:12345", True),
+        ("agent:zorro:telegram:group:123:456", True),
+        ("agent:main~:telegram:thread:123:456", True),
+        # Non-Telegram platforms keep their alert.
+        ("agent:main:discord:dm:999", False),
+        ("agent:zorro:slack:group:T1:C2", False),
+        ("agent:main:api_server:run:777", False),
+        # CLI / non-gateway keys do not match the gateway layout.
+        ("default", False),
+        ("", False),
+        ("agent:main", False),
+        # Fail-safe: non-string or malformed session keys never suppress.
+        (None, False),
+        (42, False),
+    ],
+)
+def test_approval_telegram_origin_discriminator(hermes_home, monkeypatch, session_key, expected):
+    assert hooks._approval_telegram_origin({"session_key": session_key}) is expected
+
+
+def test_telegram_origin_approval_is_suppressed_and_keeps_eligible_event(
+    hermes_home, monkeypatch,
+):
+    """A Telegram-platform session already receives the core adapter's native
+    approval prompt in the same chat, so the plugin must not duplicate it. A
+    later non-Telegram approval with the same debounce identity must still
+    notify, proving the ignored Telegram event consumed no debounce key."""
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    common = {
+        "turn_id": "t", "tool_call_id": "c", "pattern_key": "dangerous-command",
+        "command": "rm -rf /tmp/example", "description": "needs permission",
+    }
+
+    hooks.on_pre_approval_request(**common, session_key="agent:main:telegram:dm:12345", surface="gateway")
+    assert sender.send_message.call_count == 0
+
+    hooks.on_pre_approval_request(**common, session_key="agent:main:discord:dm:999", surface="gateway")
+    assert sender.send_message.call_count == 1
+    assert "Approval required" in sender.send_message.call_args.args[1]
+
+
+def test_non_telegram_gateway_approval_still_notifies(hermes_home, monkeypatch):
+    """Non-Telegram gateway sessions have no in-chat approval prompt the
+    plugin would duplicate, so their genuine human prompts keep notifying."""
+    configure(hermes_home, monkeypatch)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_pre_approval_request(
+        session_key="agent:main:discord:dm:999", turn_id="t", tool_call_id="c",
+        command="git branch -D example", description="force delete", surface="gateway",
+    )
+    assert sender.send_message.call_count == 1
+    assert "Approval required" in sender.send_message.call_args.args[1]
+
+
+def test_readme_does_not_reference_nonexistent_nousresearch_repo():
+    """Regression guard: the original attribution pointed at a
+    NousResearch-owned codex-telegram-notify that does not exist. The real
+    provenance is the maintainer's own codex-telegram-notify repository."""
+    read_me = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "NousResearch/codex-telegram-notify" not in read_me
+    assert "github.com/madpower2000/codex-telegram-notify" in read_me

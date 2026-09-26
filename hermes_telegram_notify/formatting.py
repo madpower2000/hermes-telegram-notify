@@ -145,8 +145,32 @@ def session_name(
     return "New session"
 
 
-def _session_field(session_id: Any, explicit: Any = None) -> tuple[str, str]:
-    return ("Session", session_name(session_id=session_id, explicit=explicit))
+def _common_metadata_fields(
+    *, session_id: Any = None, session_name_value: Any = None,
+    profile_name_value: Any = None, metadata: Mapping[str, str] | None = None,
+    cwd: Any = None, include_project: bool = True, include_session: bool = True,
+) -> list[tuple[str, Any]]:
+    """Shared emoji-labeled metadata block: Project, Profile, Session.
+
+    Every notification (Started, Approval, Completed/Failed/Interrupted)
+    opens with this exact block so the three message types stay visually
+    consistent. Notification-specific fields follow it.
+    """
+    if metadata is None:
+        metadata = _stored_session_metadata(session_id)
+    fields: list[tuple[str, Any]] = []
+    if include_project:
+        fields.append(("📁 Project", project_name(cwd or metadata.get("cwd"))))
+    fields.append(("👤 Profile", _profile_label(profile_name_value, metadata.get("profile_name"))))
+    if include_session:
+        fields.append((
+            "📝 Session",
+            # A missing/empty row title falls back to the session database's
+            # title lookup (``get_session_title``) instead of short-circuiting.
+            session_name(session_id=session_id, explicit=session_name_value,
+                         stored_title=metadata.get("title") or _UNSET),
+        ))
+    return fields
 
 
 def _lines(title: str, fields: list[tuple[str, Any]], max_chars: int, body: str = "") -> str:
@@ -171,15 +195,15 @@ def started(
 ) -> str:
     del task_id, turn_id
     metadata = _stored_session_metadata(session_id)
-    fields: list[tuple[str, Any]] = []
-    if include_project:
-        fields.append(("📁 Project", project_name(cwd or metadata.get("cwd"))))
-    fields.append(("👤 Profile", _profile_label(profile_name_value, metadata.get("profile_name"))))
-    if include_session:
-        fields.append((
-            "📝 Session",
-            session_name(session_id=session_id, explicit=session_name_value, stored_title=metadata.get("title", "")),
-        ))
+    fields = _common_metadata_fields(
+        session_id=session_id,
+        session_name_value=session_name_value,
+        profile_name_value=profile_name_value,
+        metadata=metadata,
+        cwd=cwd,
+        include_project=include_project,
+        include_session=include_session,
+    )
     if model:
         fields.append(("Model", model))
     return _lines(
@@ -194,7 +218,7 @@ def safe_response(value: Any, limit: int = 3200) -> str:
     return safe_text(value, limit, compact=False)
 
 
-def completion(*, status: str, session_id: Any = None, session_name_value: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, include_project: bool = True, include_session: bool = True, reason: Any = None, elapsed_seconds: Any = None, response: Any = None, response_max_chars: int = 3200, max_chars: int = 3900) -> str:
+def completion(*, status: str, session_id: Any = None, session_name_value: Any = None, profile_name_value: Any = None, task_id: Any = None, turn_id: Any = None, model: Any = None, cwd: Any = None, include_project: bool = True, include_session: bool = True, reason: Any = None, elapsed_seconds: Any = None, response: Any = None, response_max_chars: int = 3200, max_chars: int = 3900) -> str:
     del task_id, turn_id, elapsed_seconds
     status = str(status or "failed").lower()
     title = {
@@ -203,11 +227,16 @@ def completion(*, status: str, session_id: Any = None, session_name_value: Any =
         "failed": "❌ Hermes · Failed",
     }.get(status, "ℹ️ Hermes · Finished")
     body = safe_response(response, response_max_chars) if status == "completed" else ""
-    fields: list[tuple[str, Any]] = []
-    if include_project:
-        fields.append(("Project", project_name(cwd, session_id)))
-    if include_session:
-        fields.append(_session_field(session_id, session_name_value))
+    metadata = _stored_session_metadata(session_id)
+    fields = _common_metadata_fields(
+        session_id=session_id,
+        session_name_value=session_name_value,
+        profile_name_value=profile_name_value,
+        metadata=metadata,
+        cwd=cwd,
+        include_project=include_project,
+        include_session=include_session,
+    )
     if model:
         fields.append(("Model", model))
     if reason and not body:
@@ -215,20 +244,25 @@ def completion(*, status: str, session_id: Any = None, session_name_value: Any =
     return _lines(title, fields, max_chars, body)
 
 
-def approval(*, command: Any = None, description: Any = None, session_id: Any = None, session_name_value: Any = None, session_key: Any = None, turn_id: Any = None, cwd: Any = None, surface: Any = None, include_project: bool = True, include_session: bool = True, max_chars: int = 3900) -> str:
+def approval(*, command: Any = None, description: Any = None, session_id: Any = None, session_name_value: Any = None, profile_name_value: Any = None, session_key: Any = None, turn_id: Any = None, cwd: Any = None, surface: Any = None, include_project: bool = True, include_session: bool = True, max_chars: int = 3900) -> str:
     del session_key, turn_id, surface
-    fields = []
-    if include_project:
-        fields.append(("Project", project_name(cwd, session_id)))
-    if include_session:
-        fields.append(_session_field(session_id, session_name_value))
+    metadata = _stored_session_metadata(session_id)
+    fields = _common_metadata_fields(
+        session_id=session_id,
+        session_name_value=session_name_value,
+        profile_name_value=profile_name_value,
+        metadata=metadata,
+        cwd=cwd,
+        include_project=include_project,
+        include_session=include_session,
+    )
     fields.append(("Command", safe_command(command)))
     if description:
         fields.append(("Reason", safe_text(description, 500)))
     return _lines("⚠️ Hermes · Approval required", fields, max_chars)
 
 
-def approval_response(*, choice: Any = None, command: Any = None, session_id: Any = None, session_name_value: Any = None, session_key: Any = None, turn_id: Any = None, decided_by: Any = None, include_session: bool = True, max_chars: int = 3900) -> str:
+def approval_response(*, choice: Any = None, command: Any = None, session_id: Any = None, session_name_value: Any = None, profile_name_value: Any = None, session_key: Any = None, turn_id: Any = None, decided_by: Any = None, cwd: Any = None, include_project: bool = True, include_session: bool = True, max_chars: int = 3900) -> str:
     del session_key, turn_id
     value = str(choice or "unknown").replace("_", "-")
     allowed_choices = {
@@ -247,9 +281,16 @@ def approval_response(*, choice: Any = None, command: Any = None, session_id: An
         "smart-approve": "🤖✅",
         "smart-deny": "🤖❌",
     }.get(value, "ℹ️")
-    fields = []
-    if include_session:
-        fields.append(_session_field(session_id, session_name_value))
+    metadata = _stored_session_metadata(session_id)
+    fields = _common_metadata_fields(
+        session_id=session_id,
+        session_name_value=session_name_value,
+        profile_name_value=profile_name_value,
+        metadata=metadata,
+        cwd=cwd,
+        include_project=include_project,
+        include_session=include_session,
+    )
     fields.append(("Command", safe_command(command)))
     if decided_by:
         fields.append(("Decided by", safe_text(decided_by, 80)))

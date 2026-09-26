@@ -2,11 +2,12 @@
 
 `telegram-notify` is a standalone, Hermes-native lifecycle plugin that sends
 small, bounded Telegram messages when Hermes starts a turn, finishes a turn, or
-needs an approval decision. It is modeled on the operational safeguards in
-[`codex-telegram-notify`](https://github.com/NousResearch/codex-telegram-notify),
-but uses Hermes' public Python plugin API rather than Codex hook scripts.
+needs an approval decision. It adapts the notification design patterns of the
+author's earlier [`codex-telegram-notify`](https://github.com/madpower2000/codex-telegram-notify)
+Codex plugin, but uses Hermes' public Python plugin API rather than Codex hook
+scripts.
 
-Current plugin release: [`v1.1.1`](https://github.com/madpower2000/hermes-telegram-notify/releases/tag/v1.1.1).
+Current plugin release: [`v1.1.2`](https://github.com/madpower2000/hermes-telegram-notify/releases/tag/v1.1.2).
 
 ## What it does
 
@@ -25,9 +26,27 @@ and saved title. If neither the hook nor the session database has a title, the
 plugin displays `New session`; it does not derive a title from the first prompt
 or depend on Hermes' internal title-generator module.
 
-Start and completion notifications are suppressed only when Hermes reports
-`platform="subagent"`. Parent-session metadata alone is not used to classify
-an agent, and missing or other platform values retain the existing behavior.
+Lifecycle notifications (start, completion, interrupted, failed) are suppressed
+for Hermes subagents and for sessions whose platform is Telegram, because a
+Telegram-origin session already delivers its normal assistant response through
+the core Telegram gateway and the plugin copy would duplicate it in the same
+chat. Suppression happens before any dedupe/state claim, so an ignored event
+cannot consume a key a later eligible event might need. Parent-session metadata
+alone is not used to classify an agent, and missing or other platform values
+retain the existing notifying behavior.
+
+Approval notifications are user-action alerts and are handled separately:
+genuine human prompts are still notified, except for prompts raised in a
+Hermes Telegram-platform session, where the core Telegram adapter already
+shows its own approval prompt in the same chat. Smart-mode assessments remain
+suppressed as before.
+
+When the plugin uses the same Telegram credentials and home channel as Hermes
+core, it can send that one chat: bounded final assistant responses (up to
+3,200 chars), approval command/reason information (command text bounded to
+700 chars), and lifecycle status. Everything is normalized, credential-redacted,
+and length-bounded before delivery; the plugin never sends full prompts,
+conversation history, environment dumps, or model reasoning.
 
 Telegram failures, malformed payloads, missing credentials, and file-state
 problems are fail-open: they are logged or ignored and never abort the Hermes
@@ -35,11 +54,13 @@ agent turn.
 
 ## Relationship to codex-telegram-notify
 
-This project deliberately reuses the useful design principles of the Codex
-plugin: the standard-library HTTPS client, atomic mode-0600 secret/state files,
-exclusive state locking, bounded JSONL logs, safe truncation/redaction, chat-ID
-discovery, and a test-message utility. It does **not** import or modify the
-Codex plugin and has no runtime dependency on it.
+This project deliberately reuses the useful design principles of the author's
+earlier
+[`codex-telegram-notify`](https://github.com/madpower2000/codex-telegram-notify)
+Codex plugin: the standard-library HTTPS client, atomic mode-0600 secret/state
+files, exclusive state locking, bounded JSONL logs, safe truncation/redaction,
+chat-ID discovery, and a test-message utility. It does **not** import or modify
+that plugin and has no runtime dependency on it.
 
 ## Why this plugin instead of local Desktop notifications?
 

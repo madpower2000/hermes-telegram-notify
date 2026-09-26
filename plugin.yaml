@@ -1,5 +1,5 @@
 name: telegram-notify
-version: "1.1.1"
+version: "1.1.2"
 description: "Sends compact Hermes lifecycle notifications to Telegram."
 author: "madpower2000"
 license: MIT

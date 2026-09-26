@@ -91,6 +91,48 @@ def _status(kwargs: dict[str, Any]) -> str:
     return "completed"
 
 
+def _profile_name_value(kwargs: dict[str, Any]) -> str | None:
+    """Best-effort profile name from the hook payload, never a raw ID."""
+    value = kwargs.get("profile_name")
+    if isinstance(value, str) and value.strip():
+        return value
+    candidate = kwargs.get("profile")
+    return candidate if isinstance(candidate, str) else None
+
+
+def _suppress_lifecycle_platform(kwargs: dict[str, Any]) -> bool:
+    """Lifecycle platforms whose own delivery already reaches the operator.
+
+    Subagents are children of a root that notifies on its own; Telegram-origin
+    sessions deliver their normal assistant response through the core Telegram
+    gateway. Both are suppressed so the plugin does not double-post. Unknown
+    or missing platform values are intentionally NOT suppressed: fail open to
+    the existing (notifying) behavior rather than silently swallow a real
+    root event.
+    """
+    return kwargs.get("platform") in {"subagent", "telegram"}
+
+
+def _approval_telegram_origin(kwargs: dict[str, Any]) -> bool:
+    """Whether the approval was raised in a Hermes Telegram-platform session.
+
+    Hermes builds gateway approval session keys as
+    ``agent:<profile>:<platform>:<chat_type>[:...]`` (see
+    ``gateway/session.py::build_session_key``; the ``agent:<profile>``
+    namespace is always two colon-free segments, so the platform is index 2).
+    The Telegram adapter renders its own native exec-approval prompt in that
+    chat, so a plugin copy would be a duplicate and is suppressed. CLI,
+    transport, and other-platform approvals do not match this shape and keep
+    their Telegram alert. Non-strings / short / non-gateway keys fail safe to
+    ``False`` (alert preserved).
+    """
+    key = kwargs.get("session_key")
+    if not isinstance(key, str):
+        return False
+    parts = key.split(":")
+    return len(parts) >= 3 and parts[0] == "agent" and parts[2] == "telegram"
+
+
 def _approval_surface(value: Any) -> str:
     """Return a bounded surface category, never an arbitrary payload value."""
     if not isinstance(value, str):
@@ -152,7 +194,7 @@ def _send_completion(
     ``on_session_end``. The shared claim prevents the latter from sending a
     second success message after ``post_llm_call`` has already sent the result.
     """
-    if kwargs.get("platform") == "subagent":
+    if _suppress_lifecycle_platform(kwargs):
         return None
     if not cfg.event_enabled("completion"):
         return None
@@ -191,6 +233,7 @@ def _send_completion(
         if cfg.values.get("include_cwd", True) else None,
         include_project=bool(cfg.values.get("include_cwd", True)),
         include_session=bool(cfg.values.get("include_session", True)),
+        profile_name_value=_profile_name_value(kwargs),
         reason=reason,
         elapsed_seconds=elapsed,
         response=response,
@@ -220,7 +263,7 @@ def on_post_llm_call(**kwargs: Any) -> None:
 
 def on_pre_llm_call(**kwargs: Any) -> None:
     try:
-        if kwargs.get("platform") == "subagent":
+        if _suppress_lifecycle_platform(kwargs):
             return None
         cfg = config_mod.load_config()
         if not cfg.event_enabled("start"):
@@ -298,6 +341,15 @@ def on_pre_approval_request(**kwargs: Any) -> None:
             # escalate; a user-facing prompt emits its own hook if needed.
             _record(cfg, "approval_skipped", reason="smart_assessment", **diagnostics)
             return None
+        if _approval_telegram_origin(kwargs):
+            # A Telegram-platform session already receives the approval prompt
+            # through the core Telegram adapter's native exec-approval card
+            # (same chat the plugin would post to); the plugin copy is a
+            # duplicate. This returns before any debounce claim, so an ignored
+            # Telegram-origin event cannot consume a key a later eligible
+            # event might need.
+            _record(cfg, "approval_skipped", reason="telegram_origin_duplicate", **diagnostics)
+            return None
         request_key = fingerprint({
             "session": kwargs.get("session_key"),
             "turn": kwargs.get("turn_id"),
@@ -317,6 +369,7 @@ def on_pre_approval_request(**kwargs: Any) -> None:
             description=kwargs.get("description"),
             session_id=kwargs.get("session_id"),
             session_name_value=kwargs.get("session_name") or kwargs.get("session_title") or kwargs.get("title"),
+            profile_name_value=_profile_name_value(kwargs),
             session_key=kwargs.get("session_key"),
             turn_id=kwargs.get("turn_id"),
             cwd=kwargs.get("cwd") or kwargs.get("working_directory"),
@@ -357,9 +410,12 @@ def on_post_approval_response(**kwargs: Any) -> None:
             command=kwargs.get("command"),
             session_id=kwargs.get("session_id"),
             session_name_value=kwargs.get("session_name") or kwargs.get("session_title") or kwargs.get("title"),
+            profile_name_value=_profile_name_value(kwargs),
             session_key=kwargs.get("session_key"),
             turn_id=kwargs.get("turn_id"),
             decided_by=kwargs.get("decided_by"),
+            cwd=kwargs.get("cwd") or kwargs.get("working_directory"),
+            include_project=bool(cfg.values.get("include_cwd", True)),
             include_session=bool(cfg.values.get("include_session", True)),
             max_chars=int(cfg.values.get("max_message_chars", 3900)),
         )
