@@ -1201,25 +1201,35 @@ def test_approval_telegram_origin_discriminator(hermes_home, monkeypatch, sessio
     assert hooks._approval_telegram_origin({"session_key": session_key}) is expected
 
 
-def test_telegram_origin_approval_is_suppressed_and_keeps_eligible_event(
+def test_telegram_origin_pre_approval_suppression_makes_no_state_claim(
     hermes_home, monkeypatch,
 ):
-    """A Telegram-platform session already receives the core adapter's native
-    approval prompt in the same chat, so the plugin must not duplicate it. A
-    later non-Telegram approval with the same debounce identity must still
-    notify, proving the ignored Telegram event consumed no debounce key."""
+    """State-claim ordering proof (identical fingerprint, Option B).
+
+    Both calls use the EXACT same session_key/turn_id/tool_call_id/pattern/
+    command, so their ``pre:`` fingerprint is identical. Only the suppression
+    condition changes between the calls. If the suppressed Telegram-origin
+    event claimed debounce state, the second call would be debounced and
+    would not send.
+    """
     configure(hermes_home, monkeypatch)
     sender = Mock()
     monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
-    common = {
+    identity = {
+        "session_key": "agent:main:telegram:dm:12345",
         "turn_id": "t", "tool_call_id": "c", "pattern_key": "dangerous-command",
         "command": "rm -rf /tmp/example", "description": "needs permission",
+        "surface": "gateway",
     }
 
-    hooks.on_pre_approval_request(**common, session_key="agent:main:telegram:dm:12345", surface="gateway")
+    # Call 1: Telegram origin -> suppressed, and it must claim no state.
+    hooks.on_pre_approval_request(**identity)
     assert sender.send_message.call_count == 0
 
-    hooks.on_pre_approval_request(**common, session_key="agent:main:discord:dm:999", surface="gateway")
+    # Call 2: same exact identity, suppression no longer applicable -> must
+    # send exactly once. A prior (incorrect) claim would debounce this.
+    monkeypatch.setattr(hooks, "_approval_telegram_origin", lambda _kwargs: False)
+    hooks.on_pre_approval_request(**identity)
     assert sender.send_message.call_count == 1
     assert "Approval required" in sender.send_message.call_args.args[1]
 
@@ -1238,6 +1248,119 @@ def test_non_telegram_gateway_approval_still_notifies(hermes_home, monkeypatch):
     assert "Approval required" in sender.send_message.call_args.args[1]
 
 
+@pytest.mark.parametrize("choice", ["once", "session", "always", "deny", "timeout", "cancelled", "notify_failed"])
+def test_telegram_origin_gateway_approval_response_is_suppressed(
+    hermes_home, monkeypatch, choice,
+):
+    """With response notifications enabled, a genuine Telegram-origin gateway
+    approval result (the native card the core adapter already edited in chat)
+    must not produce a second plugin copy."""
+    configure(hermes_home, monkeypatch, notify_on_approval_response=True)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_post_approval_response(
+        session_key="agent:main:telegram:dm:12345", turn_id="t", tool_call_id="c",
+        command="git branch -D example", surface="gateway", choice=choice,
+    )
+    assert sender.send_message.call_count == 0
+
+
+def test_telegram_origin_response_suppression_makes_no_state_claim(
+    hermes_home, monkeypatch,
+):
+    """State-claim ordering proof for the response hook (identical
+    fingerprint, Option B).
+
+    Both calls use the EXACT same session_key/turn_id/tool_call_id/choice,
+    so their ``post:`` fingerprint is identical. Only the suppression
+    condition changes between the calls. If the suppressed Telegram-origin
+    response claimed post-approval state, the second call would be debounced
+    (86400 s window) and would not send.
+    """
+    configure(hermes_home, monkeypatch, notify_on_approval_response=True)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    identity = {
+        "session_key": "agent:main:telegram:dm:12345",
+        "turn_id": "t", "tool_call_id": "c",
+        "command": "git branch -D example", "choice": "once", "surface": "gateway",
+    }
+
+    # Call 1: Telegram-origin gateway response -> suppressed, no claim.
+    hooks.on_post_approval_response(**identity)
+    assert sender.send_message.call_count == 0
+
+    # Call 2: same exact identity, suppression no longer applicable -> must
+    # send exactly once. A prior (incorrect) claim would debounce this.
+    monkeypatch.setattr(hooks, "_approval_telegram_duplicate_response", lambda _kwargs: False)
+    hooks.on_post_approval_response(**identity)
+    assert sender.send_message.call_count == 1
+    assert "Approval once" in sender.send_message.call_args.args[1]
+
+
+def test_telegram_origin_smart_verdict_response_still_notifies(
+    hermes_home, monkeypatch,
+):
+    """Smart verdicts are not rendered by the core Telegram adapter, so the
+    opt-in informational copy is not a duplicate and must keep notifying —
+    even for a Telegram-platform session key."""
+    configure(hermes_home, monkeypatch, notify_on_approval_response=True)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_post_approval_response(
+        session_key="agent:main:telegram:dm:12345", turn_id="t", tool_call_id="c",
+        command="rm -rf /tmp/example", surface="smart",
+        choice="smart_deny", decided_by="aux_llm",
+    )
+    assert sender.send_message.call_count == 1
+    text = sender.send_message.call_args.args[1]
+    assert "smart-deny" in text
+    assert "aux_llm" in text
+
+
+def test_non_telegram_gateway_approval_response_still_notifies(
+    hermes_home, monkeypatch,
+):
+    """Non-Telegram gateway approval results keep their existing plugin
+    notification behavior."""
+    configure(hermes_home, monkeypatch, notify_on_approval_response=True)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_post_approval_response(
+        session_key="agent:main:discord:dm:999", turn_id="t", tool_call_id="c",
+        command="git branch -D example", surface="gateway", choice="once",
+    )
+    assert sender.send_message.call_count == 1
+    assert "Approval once" in sender.send_message.call_args.args[1]
+
+
+@pytest.mark.parametrize(
+    ("session_key", "surface"),
+    [
+        (None, "gateway"),
+        (42, "gateway"),
+        ("", "gateway"),
+        ("default", "gateway"),
+        ("agent:main", "gateway"),
+        (None, None),
+        ("agent:main:telegram:dm:12345", None),
+    ],
+)
+def test_malformed_session_key_response_fails_open(
+    hermes_home, monkeypatch, session_key, surface,
+):
+    """A malformed or absent session key / surface must fail open: the
+    legitimate response notification is preserved, never suppressed."""
+    configure(hermes_home, monkeypatch, notify_on_approval_response=True)
+    sender = Mock()
+    monkeypatch.setattr(hooks, "TelegramClient", lambda *a, **k: sender)
+    hooks.on_post_approval_response(
+        session_key=session_key, turn_id="t", tool_call_id="c",
+        command="git status", surface=surface, choice="once",
+    )
+    assert sender.send_message.call_count == 1
+
+
 def test_readme_does_not_reference_nonexistent_nousresearch_repo():
     """Regression guard: the original attribution pointed at a
     NousResearch-owned codex-telegram-notify that does not exist. The real
@@ -1245,3 +1368,86 @@ def test_readme_does_not_reference_nonexistent_nousresearch_repo():
     read_me = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "NousResearch/codex-telegram-notify" not in read_me
     assert "github.com/madpower2000/codex-telegram-notify" in read_me
+
+
+@pytest.fixture
+def _mock_stored_metadata(monkeypatch):
+    """Pin the session-row metadata so formatter tests are deterministic and
+    never touch a real Hermes state.db."""
+    monkeypatch.setattr(
+        formatting, "_stored_session_metadata",
+        lambda _sid: {"cwd": "/home/max/Projects/Tripwire", "profile_name": "zorro", "title": "Tripwire event-study review"},
+    )
+
+
+def test_completion_exposes_shared_metadata_block(_mock_stored_metadata, monkeypatch):
+    """Outcome A: completion opens with the Project/Profile/Session block and
+    honors the documented include_cwd / include_session / include_model knobs."""
+    text = formatting.completion(
+        status="completed", session_id="sid", profile_name_value="zorro",
+        model="provider/model", cwd="/home/max/Projects/Tripwire",
+        response="done",
+    )
+    assert text.startswith("✅ Hermes · Completed")
+    lines = text.splitlines()
+    assert lines[1] == "📁 Project: Tripwire"
+    assert lines[2] == "👤 Profile: zorro"
+    assert lines[3] == "📝 Session: Tripwire event-study review"
+    assert "Model: provider/model" in text
+    assert "done" in text
+
+
+def test_completion_include_flags_gate_metadata(_mock_stored_metadata, monkeypatch):
+    text = formatting.completion(
+        status="completed", session_id="sid", response="done",
+        include_project=False, include_session=False,
+    )
+    assert "📁 Project" not in text
+    assert "📝 Session" not in text
+    # Profile identity is still emitted unconditionally.
+    assert "👤 Profile" in text
+
+
+def test_approval_exposes_shared_metadata_block(_mock_stored_metadata, monkeypatch):
+    text = formatting.approval(
+        command="git branch -D example", description="force delete",
+        session_id="sid", profile_name_value="zorro", cwd="/home/max/Projects/Tripwire",
+    )
+    assert text.startswith("⚠️ Hermes · Approval required")
+    lines = text.splitlines()
+    assert lines[1] == "📁 Project: Tripwire"
+    assert lines[2] == "👤 Profile: zorro"
+    assert lines[3] == "📝 Session: Tripwire event-study review"
+    assert "Command: git branch -D example" in text
+    assert "Reason: force delete" in text
+
+
+def test_approval_response_exposes_shared_metadata_block(_mock_stored_metadata, monkeypatch):
+    text = formatting.approval_response(
+        choice="once", command="git branch -D example", session_id="sid",
+        profile_name_value="zorro", decided_by="user", cwd="/home/max/Projects/Tripwire",
+    )
+    assert text.startswith("✅ Hermes · Approval once")
+    lines = text.splitlines()
+    assert lines[1] == "📁 Project: Tripwire"
+    assert lines[2] == "👤 Profile: zorro"
+    assert lines[3] == "📝 Session: Tripwire event-study review"
+    assert "Command: git branch -D example" in text
+    assert "Decided by: user" in text
+
+
+def test_metadata_free_text_remains_redacted_and_bounded(monkeypatch):
+    """Redaction/bounding of the shared block is preserved: a secret in the
+    stored session title or command is never emitted, and long text is cut."""
+    monkeypatch.setattr(
+        formatting, "_stored_session_metadata",
+        lambda _sid: {"cwd": "/home/max/Projects/Tripwire", "profile_name": "zorro",
+                      "title": "review 987654:synthetic_test_value_only_not_real context"},
+    )
+    text = formatting.approval(
+        command="run --api-key=supersecret-value " + "x" * 2000,
+        session_id="sid", cwd="/home/max/Projects/Tripwire", max_chars=300,
+    )
+    assert "987654:synthetic_test_value_only_not_real" not in text
+    assert "supersecret-value" not in text
+    assert len(text) <= 300

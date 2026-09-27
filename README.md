@@ -7,7 +7,7 @@ author's earlier [`codex-telegram-notify`](https://github.com/madpower2000/codex
 Codex plugin, but uses Hermes' public Python plugin API rather than Codex hook
 scripts.
 
-Current plugin release: [`v1.1.2`](https://github.com/madpower2000/hermes-telegram-notify/releases/tag/v1.1.2).
+Current plugin release: [`v1.1.3`](https://github.com/madpower2000/hermes-telegram-notify/releases/tag/v1.1.3).
 
 ## What it does
 
@@ -19,7 +19,7 @@ The plugin registers five observer hooks:
 | `post_llm_call` | **✅ Hermes · Completed** plus the final assistant response and optional model metadata |
 | `on_session_end` | **⏸️ Interrupted** or **❌ Failed** fallback notification |
 | `pre_approval_request` | **⚠️ Hermes · Approval required** for user-facing prompts; smart assessments are suppressed |
-| `post_approval_response` | Optional decision/timeout message with emoji |
+| `post_approval_response` | Optional decision/timeout message with emoji; Telegram-origin native approval results are suppressed (see below) |
 
 Started messages use the profile-scoped session record for the project, profile,
 and saved title. If neither the hook nor the session database has a title, the
@@ -40,6 +40,17 @@ genuine human prompts are still notified, except for prompts raised in a
 Hermes Telegram-platform session, where the core Telegram adapter already
 shows its own approval prompt in the same chat. Smart-mode assessments remain
 suppressed as before.
+
+When `notify_on_approval_response` is enabled, the plugin also posts the
+approval *result* (approved / denied / timeout). That copy is suppressed for
+genuine Telegram-origin gateway approvals — the core adapter edits the same
+in-chat card when the user answers, so a plugin message would be a duplicate.
+The suppression happens before any post-approval state claim, so an ignored
+response cannot consume a key a later eligible response might need. Smart
+verdicts (`smart_approve` / `smart_deny`) are *not* rendered by the core
+Telegram adapter, so they keep their opt-in informational behavior even for
+Telegram-platform sessions; CLI, transport, and other-platform results are
+unchanged.
 
 When the plugin uses the same Telegram credentials and home channel as Hermes
 core, it can send that one chat: bounded final assistant responses (up to
@@ -317,24 +328,28 @@ hermes logs --level INFO
 
 ## Message safety and formatting
 
-Messages identify Hermes explicitly and stay compact. Start messages contain
-the project identity, human-readable session title, and model metadata by
-default. `include_cwd` controls whether the project/workspace identity is shown
-(not whether a raw path is sent); `include_session` controls session titles;
-`include_model` controls model labels in start/completion notices. Each option is
-honored by the emitted Telegram text. When no explicit or stored title exists,
-the plugin shows `New session` rather than exposing a raw technical ID or
-deriving a title from the prompt. Successful completion messages contain the
-bounded final assistant response. Approval messages contain a sanitized command
-and optional reason; interrupted/failed messages contain a short reason. Turn
-IDs and elapsed timing are omitted. In a named profile, the profile name (for
-example, `zorro`) is used as the project identity when Hermes does not provide
-an explicit working directory. All arbitrary free text sent to Telegram is
-normalized, redacted, and bounded, including approval descriptions, failure and
-interruption reasons, titles, project/profile labels, model labels, commands,
-decision metadata, and successful final responses. The plugin never sends full
-prompts, conversation history, environment dumps, model reasoning, or
-unrestricted command output.
+Messages identify Hermes explicitly and stay compact. Every notification
+(Started, Completed/Failed/Interrupted, Approval required, Approval response)
+opens with the same emoji-labeled metadata block: 📁 Project, 👤 Profile, 📝
+Session. `include_cwd` controls whether the project/workspace identity is
+shown (not whether a raw path is sent); `include_session` controls session
+titles; `include_model` controls model labels in start/completion notices.
+Each option is honored by the emitted Telegram text. The profile identity is
+always emitted: it is the operator-facing identity of which Hermes profile is
+running, and the only way it can be a surprising value is one the operator
+configured. When no explicit or stored title exists, the plugin shows `New
+session` rather than exposing a raw technical ID or deriving a title from the
+prompt. Successful completion messages contain the bounded final assistant
+response. Approval messages contain a sanitized command and optional reason;
+interrupted/failed messages contain a short reason. Turn IDs and elapsed
+timing are omitted. In a named profile, the profile name (for example,
+`zorro`) is used as the project identity when Hermes does not provide an
+explicit working directory. All arbitrary free text sent to Telegram is
+normalized, redacted, and bounded, including approval descriptions, failure
+and interruption reasons, titles, project/profile labels, model labels,
+commands, decision metadata, and successful final responses. The plugin never
+sends full prompts, conversation history, environment dumps, model reasoning,
+or unrestricted command output.
 
 ## State, locking, and duplicate suppression
 

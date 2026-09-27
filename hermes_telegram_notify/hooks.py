@@ -180,6 +180,36 @@ def _approval_decided_by(value: Any) -> str:
     return "unknown" if value in (None, "") else "other"
 
 
+def _approval_telegram_duplicate_response(kwargs: dict[str, Any]) -> bool:
+    """Whether a ``post_approval_response`` is a Telegram-native approval result.
+
+    The core Telegram adapter renders the exec-approval card and edits it in
+    place when the user answers in chat (``plugins/platforms/telegram/adapter.py``
+    ``_send_exec_approval_prompt`` / ``_handle_exec_approval_callback``). A
+    plugin copy of the same outcome in the same chat is a duplicate and is
+    suppressed.
+
+    Two signals must agree, read from the hook payload (``tools/approval_
+    gateway_wait.py::_await_gateway_decision`` fires both the request and the
+    response hook with the gateway ``session_key`` and ``surface="gateway"``;
+    the layout is ``agent:<profile>:telegram:<chat_type>[:...]`` from
+    ``gateway/session.py::build_session_key``):
+
+    * the session key names a Telegram-platform session, and
+    * the surface is the genuine gateway exec-approval (``"gateway"``), i.e. a
+      user-facing native prompt — not a smart assessment (``"smart"``), a CLI
+      panel (``"cli"``), or a plugin transport (``"transport:*"``).
+
+    Smart verdicts are deliberately NOT suppressed: the core Telegram adapter
+    does not render ``smart_approve`` / ``smart_deny`` in chat, so the opt-in
+    informational message is not a duplicate. Unknown/missing/short session
+    keys and unexpected surface values fail open to the notifying behavior.
+    """
+    if not _approval_telegram_origin(kwargs):
+        return False
+    return kwargs.get("surface") == "gateway"
+
+
 def _send_completion(
     cfg: config_mod.ResolvedConfig,
     kwargs: dict[str, Any],
@@ -401,6 +431,16 @@ def on_post_approval_response(**kwargs: Any) -> None:
         }
         _record(cfg, "approval_response_observed", **diagnostics)
         if not cfg.event_enabled("approval_response") or not cfg.configured:
+            return None
+        if _approval_telegram_duplicate_response(kwargs):
+            # A Telegram-platform session already shows the native approval
+            # card and its resolved outcome in-chat through the core adapter;
+            # the plugin copy would be a duplicate. This returns before any
+            # post-approval state claim, so an ignored Telegram-origin
+            # response cannot consume the key a later eligible response for
+            # the same identity might need. Smart and non-gateway verdicts
+            # are not duplicates and keep notifying.
+            _record(cfg, "approval_response_skipped", reason="telegram_origin_duplicate", **diagnostics)
             return None
         key = f"post:{fingerprint({'session': kwargs.get('session_key'), 'turn': kwargs.get('turn_id'), 'tool_call': kwargs.get('tool_call_id'), 'choice': choice})}"
         if not _state(cfg).claim_approval(key, {"event": "post_approval", "choice": choice}, 86400):
